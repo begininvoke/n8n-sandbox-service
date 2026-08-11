@@ -46,6 +46,12 @@ export GIT_SHA="$(jq -r .git_sha MANIFEST.json)"
 
 Rebuild the snapshot on each physical runner host (Firecracker snapshots are not portable).
 
+Alternatively, leave mem/state unset and point the runner at the bundle script via
+`SANDBOX_RUNNER_FIRECRACKER_CREATE_SNAPSHOT_SCRIPT` and
+`SANDBOX_RUNNER_FIRECRACKER_DAEMON_BIN`; `Prepare` will create the snapshot once
+and run an admission canary before marking the runner healthy. Production Azure
+VMSS images use this path: first-boot builds the rootfs template only.
+
 ## 2. Runner
 
 ### Option A: Docker Hub image (recommended)

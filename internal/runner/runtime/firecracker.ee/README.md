@@ -11,6 +11,17 @@ host Firecracker setup and local snapshot cache.
 - Runs each microVM in a Linux network namespace with a TAP device.
 - Exposes the guest daemon through a host-local TCP proxy.
 
+## Admission (Prepare / Ready)
+
+On startup `Prepare` gates the runner before heartbeats report healthy:
+
+1. Host NAT — enable IPv4 forwarding and idempotent MASQUERADE/FORWARD rules. Transient failures are retried with admission backoff (success is cached; failures are not).
+2. Pin guest assets — jailer, firecracker, `template/rootfs.ext4`, `template/vmlinux`, and optional `MANIFEST.json` / expected `git_sha` / daemon checksum.
+3. Ensure golden snapshot — if mem/state are missing and `SANDBOX_RUNNER_FIRECRACKER_CREATE_SNAPSHOT_SCRIPT` is set, run `create-golden-snapshot.sh` on this host (snapshots are not portable across CPU gens). Production Firecracker VM images set this so the runner owns snapshot creation after first-boot builds the rootfs template.
+4. Admission canary — create a throwaway sandbox (`admission-canary-*`), probe `/healthz`, a tiny `POST /executions`, and a files put/get round-trip, then delete it. Canary deletion must fully release its slot; cleanup failure fails admission (and retries purge leftover canaries) so capacity-1 runners are never marked healthy with a permanently consumed slot.
+
+Until admission succeeds, `Ready()` fails, `/readyz` is not ready, and registration heartbeats send `Healthy=false`. Failed admission retries with backoff while the process runs.
+
 ## Networking
 
 Each sandbox slot gets an isolated Linux network namespace. Three interfaces
