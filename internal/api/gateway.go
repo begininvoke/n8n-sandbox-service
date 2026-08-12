@@ -62,6 +62,7 @@ func NewGatewayRouter(s store.SandboxStore, cfg *config.APIConfig, reg registry.
 	mux.HandleFunc("DELETE /jobs/{id}", jobProxy)
 
 	var handler http.Handler = mux
+	handler = PayloadLoggingMiddleware(handler)
 	if rec.Enabled() {
 		handler = metrics.HTTPMiddleware(rec)(handler)
 	}
