@@ -66,7 +66,7 @@ func (f *fakeRuntime) DaemonURL(context.Context, string) (string, error) {
 func (f *fakeRuntime) Shutdown(context.Context) {}
 
 func TestRunnerLivenessEndpointsDoNotCheckRuntime(t *testing.T) {
-	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime down")}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime down")}, nil, &config.Config{}, metrics.NewRunnerRecorder(false))
 
 	for _, path := range []string{"/healthz", "/livez"} {
 		t.Run(path, func(t *testing.T) {
@@ -83,7 +83,7 @@ func TestRunnerLivenessEndpointsDoNotCheckRuntime(t *testing.T) {
 }
 
 func TestRunnerReadyzChecksRuntime(t *testing.T) {
-	router := NewRouter(&fakeRuntime{}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	router := NewRouter(&fakeRuntime{}, nil, &config.Config{}, metrics.NewRunnerRecorder(false))
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
 
@@ -95,7 +95,7 @@ func TestRunnerReadyzChecksRuntime(t *testing.T) {
 }
 
 func TestRunnerReadyzFailsWhenRuntimeUnavailable(t *testing.T) {
-	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime down")}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime down")}, nil, &config.Config{}, metrics.NewRunnerRecorder(false))
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
 
@@ -107,7 +107,7 @@ func TestRunnerReadyzFailsWhenRuntimeUnavailable(t *testing.T) {
 }
 
 func TestRunnerReadyzFailsWhenRuntimeNotReady(t *testing.T) {
-	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime not ready")}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime not ready")}, nil, &config.Config{}, metrics.NewRunnerRecorder(false))
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
 
@@ -120,7 +120,7 @@ func TestRunnerReadyzFailsWhenRuntimeNotReady(t *testing.T) {
 
 func TestRunnerMetricsEndpointEnabledBypassesAuth(t *testing.T) {
 	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}}
-	router := NewRouter(&fakeRuntime{}, cfg, metrics.NewRunnerRecorder(true))
+	router := NewRouter(&fakeRuntime{}, nil, cfg, metrics.NewRunnerRecorder(true))
 
 	// Warm-up: a request the mux can dispatch so HTTPMiddleware records a series.
 	// Scrapes only emit families that have at least one observed series.
@@ -149,7 +149,7 @@ func TestRunnerMetricsEndpointEnabledBypassesAuth(t *testing.T) {
 
 func TestRunnerMetricsEndpointDisabledReturns404(t *testing.T) {
 	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}}
-	router := NewRouter(&fakeRuntime{}, cfg, metrics.NewRunnerRecorder(false))
+	router := NewRouter(&fakeRuntime{}, nil, cfg, metrics.NewRunnerRecorder(false))
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	req.Header.Set("X-Api-Key", "k")

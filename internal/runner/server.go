@@ -11,9 +11,11 @@ import (
 	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
 )
 
-// NewRouter creates the HTTP handler for container operations. If rec is
-// enabled, its /metrics handler is mounted and HTTPMiddleware wraps the chain.
-func NewRouter(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.RunnerRecorder) http.Handler {
+// NewRouter creates the HTTP handler for container and job operations. If rec
+// is enabled, its /metrics handler is mounted and HTTPMiddleware wraps the
+// chain. jobs may be nil (e.g. the firecracker.ee runtime doesn't support
+// jobs), in which case job routes answer 501.
+func NewRouter(rt runnerruntime.Runtime, jobs JobManager, cfg *config.Config, rec *metrics.RunnerRecorder) http.Handler {
 	mux := http.NewServeMux()
 
 	livenessHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +62,14 @@ func NewRouter(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.Runner
 	mux.HandleFunc("DELETE /sandboxes/{id}/files", proxy)
 	mux.HandleFunc("POST /sandboxes/{id}/mkdir", proxy)
 	mux.HandleFunc("GET /sandboxes/{id}/stat", proxy)
+
+	mux.HandleFunc("POST /jobs", requireJobs(jobs, CreateJob(jobs)))
+	mux.HandleFunc("GET /jobs/{id}", requireJobs(jobs, GetJob(jobs)))
+	mux.HandleFunc("PUT /jobs/{id}/files", requireJobs(jobs, StageJobFile(jobs, cfg)))
+	mux.HandleFunc("POST /jobs/{id}/start", requireJobs(jobs, StartJob(jobs)))
+	mux.HandleFunc("GET /jobs/{id}/events", requireJobs(jobs, JobEvents(jobs)))
+	mux.HandleFunc("GET /jobs/{id}/files/content", requireJobs(jobs, JobOutputFile(jobs)))
+	mux.HandleFunc("DELETE /jobs/{id}", requireJobs(jobs, DeleteJob(jobs)))
 
 	// Apply middleware (outermost first)
 	var handler http.Handler = mux

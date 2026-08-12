@@ -77,7 +77,11 @@ func Run(cfg *config.Config, rt runnerruntime.Runtime) {
 		slog.Info("metrics endpoint enabled", "path", "/metrics")
 	}
 
-	handler := runner.NewRouter(rt, cfg, mrec)
+	// Not every runtime backend supports jobs (firecracker.ee doesn't); the
+	// type assertion is nil when it's unsupported, and NewRouter answers 501
+	// for job routes in that case.
+	jobs, _ := rt.(runner.JobManager)
+	handler := runner.NewRouter(rt, jobs, cfg, mrec)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
