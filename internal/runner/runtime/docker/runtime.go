@@ -58,6 +58,12 @@ type Runtime struct {
 	imageReady    atomic.Bool
 	imageReadyCh  chan struct{}
 
+	// fetchClient is the hardened HTTP client used by StageJobFileFromURL. It
+	// is a field (not a package-level var) so tests can swap in a permissive
+	// client/transport for a happy-path test against httptest.NewServer,
+	// which listens on 127.0.0.1 — an address the real guard blocks.
+	fetchClient *http.Client
+
 	jobsMu   sync.Mutex
 	jobs     map[string]*job
 	jobExecs *daemon.ExecManager
@@ -99,6 +105,7 @@ func newRuntime(runnerConfig *config.Config, cfg Config, docker dockerBackend) *
 		teardownRules: netrules.Teardown,
 		waitForDaemon: waitForDaemon,
 		imageReadyCh:  make(chan struct{}),
+		fetchClient:   newJobFetchClient(),
 		jobs:          make(map[string]*job),
 		jobExecs:      daemon.NewExecManager(),
 	}

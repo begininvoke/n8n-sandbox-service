@@ -197,6 +197,53 @@ func (m *Runtime) StageJobFile(id, relPath string, r io.Reader, maxBytes int64) 
 	return nil
 }
 
+// StageJobFileFromURL downloads rawURL into the job's staging directory,
+// enforcing the same staging-state gate and path validation as StageJobFile.
+// The download goes through the runtime's hardened fetch client (see
+// fetch.go), which refuses private/special-use destinations at dial time.
+func (m *Runtime) StageJobFileFromURL(ctx context.Context, id, relPath, rawURL string, maxBytes int64) error {
+	j, err := m.lookupJob(id)
+	if err != nil {
+		return err
+	}
+	if err := validateJobPath(relPath); err != nil {
+		return err
+	}
+	if _, err := validateFetchURL(rawURL); err != nil {
+		return err
+	}
+
+	j.mu.Lock()
+	staging := j.status == jobStatusStaging
+	stagingDir := j.stagingDir
+	j.mu.Unlock()
+	if !staging {
+		return ErrJobNotStaging
+	}
+
+	dest := filepath.Join(stagingDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o777); err != nil {
+		return fmt.Errorf("create job file directory: %w", err)
+	}
+
+	f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	if err != nil {
+		return fmt.Errorf("create job file: %w", err)
+	}
+	fetchErr := fetchURLToWriter(ctx, m.fetchClient, rawURL, f, maxBytes)
+	closeErr := f.Close()
+
+	switch {
+	case fetchErr != nil:
+		_ = os.Remove(dest)
+		return fetchErr
+	case closeErr != nil:
+		_ = os.Remove(dest)
+		return fmt.Errorf("write job file: %w", closeErr)
+	}
+	return nil
+}
+
 // StartJob transitions a staging job to running and starts its container in the
 // background. It returns the event log the caller can stream.
 func (m *Runtime) StartJob(id string) (*daemon.Execution, error) {

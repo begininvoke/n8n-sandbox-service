@@ -25,6 +25,10 @@ type fakeJobManager struct {
 
 	stageErr error
 
+	fetchErr    error
+	fetchedPath string
+	fetchedURL  string
+
 	startEx  *daemon.Execution
 	startErr error
 
@@ -50,6 +54,12 @@ func (f *fakeJobManager) StageJobFile(id, relPath string, r io.Reader, maxBytes 
 	}
 	_, err := io.Copy(io.Discard, io.LimitReader(r, maxBytes+1))
 	return err
+}
+
+func (f *fakeJobManager) StageJobFileFromURL(ctx context.Context, id, relPath, rawURL string, maxBytes int64) error {
+	f.fetchedPath = relPath
+	f.fetchedURL = rawURL
+	return f.fetchErr
 }
 
 func (f *fakeJobManager) StartJob(id string) (*daemon.Execution, error) {
@@ -110,6 +120,7 @@ func TestJobRoutesReturn501WhenUnsupported(t *testing.T) {
 		{http.MethodPost, "/jobs"},
 		{http.MethodGet, "/jobs/" + testJobID},
 		{http.MethodPut, "/jobs/" + testJobID + "/files?path=out.txt"},
+		{http.MethodPost, "/jobs/" + testJobID + "/files/fetch"},
 		{http.MethodPost, "/jobs/" + testJobID + "/start"},
 		{http.MethodGet, "/jobs/" + testJobID + "/events"},
 		{http.MethodGet, "/jobs/" + testJobID + "/files/content?path=out.txt"},
@@ -267,6 +278,109 @@ func TestStageJobFile(t *testing.T) {
 		}
 		if got := decodeJobError(t, rec).Code; got != "payload_too_large" {
 			t.Errorf("code = %q, want %q", got, "payload_too_large")
+		}
+	})
+}
+
+func TestStageJobFileFromURL(t *testing.T) {
+	t.Run("204 happy path", func(t *testing.T) {
+		fake := &fakeJobManager{}
+		router := jobsTestRouter(fake, jobsTestConfig())
+
+		body := strings.NewReader(`{"path":"cat.jpg","url":"https://example.com/cat.jpg"}`)
+		rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusNoContent, rec.Body.String())
+		}
+		if fake.fetchedPath != "cat.jpg" || fake.fetchedURL != "https://example.com/cat.jpg" {
+			t.Errorf("manager called with (%q, %q), want (cat.jpg, https://example.com/cat.jpg)", fake.fetchedPath, fake.fetchedURL)
+		}
+	})
+
+	t.Run("400 invalid path", func(t *testing.T) {
+		router := jobsTestRouter(&fakeJobManager{}, jobsTestConfig())
+		body := strings.NewReader(`{"path":"../etc/passwd","url":"https://example.com/x"}`)
+		rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+		if got := decodeJobError(t, rec).Code; got != "invalid_request" {
+			t.Errorf("code = %q, want %q", got, "invalid_request")
+		}
+	})
+
+	t.Run("400 invalid url", func(t *testing.T) {
+		for _, raw := range []string{"not a url", "ftp://example.com/x", ""} {
+			t.Run(raw, func(t *testing.T) {
+				router := jobsTestRouter(&fakeJobManager{}, jobsTestConfig())
+				body := strings.NewReader(`{"path":"cat.jpg","url":"` + raw + `"}`)
+				rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusBadRequest, rec.Body.String())
+				}
+				if got := decodeJobError(t, rec).Code; got != "invalid_request" {
+					t.Errorf("code = %q, want %q", got, "invalid_request")
+				}
+			})
+		}
+	})
+
+	t.Run("404 not found", func(t *testing.T) {
+		fake := &fakeJobManager{fetchErr: docker.ErrJobNotFound}
+		router := jobsTestRouter(fake, jobsTestConfig())
+		body := strings.NewReader(`{"path":"cat.jpg","url":"https://example.com/cat.jpg"}`)
+		rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+		if got := decodeJobError(t, rec).Code; got != "not_found" {
+			t.Errorf("code = %q, want %q", got, "not_found")
+		}
+	})
+
+	t.Run("409 job not staging", func(t *testing.T) {
+		fake := &fakeJobManager{fetchErr: docker.ErrJobNotStaging}
+		router := jobsTestRouter(fake, jobsTestConfig())
+		body := strings.NewReader(`{"path":"cat.jpg","url":"https://example.com/cat.jpg"}`)
+		rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+		}
+		if got := decodeJobError(t, rec).Code; got != "job_not_staging" {
+			t.Errorf("code = %q, want %q", got, "job_not_staging")
+		}
+	})
+
+	t.Run("413 payload too large", func(t *testing.T) {
+		fake := &fakeJobManager{fetchErr: docker.ErrJobFetchTooLarge}
+		router := jobsTestRouter(fake, jobsTestConfig())
+		body := strings.NewReader(`{"path":"cat.jpg","url":"https://example.com/cat.jpg"}`)
+		rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
+		}
+		if got := decodeJobError(t, rec).Code; got != "payload_too_large" {
+			t.Errorf("code = %q, want %q", got, "payload_too_large")
+		}
+	})
+
+	t.Run("502 fetch failed", func(t *testing.T) {
+		fake := &fakeJobManager{fetchErr: &docker.JobFetchError{}}
+		router := jobsTestRouter(fake, jobsTestConfig())
+		body := strings.NewReader(`{"path":"cat.jpg","url":"https://example.com/cat.jpg"}`)
+		rec := doJobRequest(t, router, http.MethodPost, "/jobs/"+testJobID+"/files/fetch", body)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusBadGateway, rec.Body.String())
+		}
+		if got := decodeJobError(t, rec).Code; got != "fetch_failed" {
+			t.Errorf("code = %q, want %q", got, "fetch_failed")
 		}
 	})
 }

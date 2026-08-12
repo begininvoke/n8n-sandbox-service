@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 type JobManager interface {
 	CreateJob(id string, spec docker.JobSpec) (*docker.JobRecord, error)
 	StageJobFile(id, relPath string, r io.Reader, maxBytes int64) error
+	StageJobFileFromURL(ctx context.Context, id, relPath, rawURL string, maxBytes int64) error
 	StartJob(id string) (*daemon.Execution, error)
 	JobEvents(id string) (*daemon.Execution, error)
 	GetJob(id string) (*docker.JobRecord, error)
@@ -33,6 +35,10 @@ type JobManager interface {
 // maxJobCreateBodyBytes bounds the create-job request body (id + JobSpec),
 // mirroring the API gateway's own limit.
 const maxJobCreateBodyBytes = 1 << 20 // 1 MiB
+
+// maxJobFetchBodyBytes bounds the fetch-by-URL request body: it only ever
+// carries a path and a URL, so it stays far below the file-upload cap.
+const maxJobFetchBodyBytes = 1 << 16 // 64 KiB
 
 // jobIDRe/jobPathRe mirror the (unexported) validation the job manager itself
 // enforces in internal/runner/runtime/docker/jobs.go; duplicated here so
@@ -52,6 +58,17 @@ const (
 
 func isValidJobID(id string) bool {
 	return len(id) >= jobIDMinLen && len(id) <= jobIDMaxLen && jobIDRe.MatchString(id)
+}
+
+// isValidFetchURL mirrors (for early rejection, before ever calling into the
+// job manager) the check docker.validateFetchURL performs: the URL must
+// parse and use http/https.
+func isValidFetchURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func isValidJobPath(p string) bool {
@@ -199,6 +216,64 @@ func StageJobFile(jobs JobManager, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// stageJobFileFromURLRequest is the POST /jobs/{id}/files/fetch request body.
+type stageJobFileFromURLRequest struct {
+	Path string `json:"path"`
+	URL  string `json:"url"`
+}
+
+// StageJobFileFromURL handles POST /jobs/{id}/files/fetch: the runner
+// downloads url server-side into the job's staging directory, saving the
+// caller a download-then-reupload round trip.
+func StageJobFileFromURL(jobs JobManager, cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if !isValidJobID(id) {
+			writeJobError(w, http.StatusBadRequest, "invalid_request", "invalid job id")
+			return
+		}
+
+		var req stageJobFileFromURLRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJobFetchBodyBytes)).Decode(&req); err != nil {
+			writeJobError(w, http.StatusBadRequest, "invalid_request", "invalid request body")
+			return
+		}
+		if !isValidJobPath(req.Path) {
+			writeJobError(w, http.StatusBadRequest, "invalid_request", "invalid path")
+			return
+		}
+		if !isValidFetchURL(req.URL) {
+			writeJobError(w, http.StatusBadRequest, "invalid_request", "invalid url")
+			return
+		}
+
+		err := jobs.StageJobFileFromURL(r.Context(), id, req.Path, req.URL, cfg.MaxFileBytes)
+		if err != nil {
+			writeJobFetchError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// writeJobFetchError maps StageJobFileFromURL's error results onto the
+// contract's status/code pairs. Unlike writeJobManagerError, a fetch failure
+// (DNS, connect, non-2xx, timeout, or an SSRF-blocked destination) is an
+// expected outcome of downloading caller-supplied input, not an internal
+// error, so it gets its own 502 fetch_failed mapping instead of falling
+// through to the 500 default.
+func writeJobFetchError(w http.ResponseWriter, err error) {
+	var fetchErr *docker.JobFetchError
+	switch {
+	case errors.Is(err, docker.ErrJobFetchTooLarge):
+		writeJobError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "downloaded file exceeds maximum allowed size")
+	case errors.As(err, &fetchErr):
+		writeJobError(w, http.StatusBadGateway, "fetch_failed", fetchErr.Error())
+	default:
+		writeJobManagerError(w, err)
 	}
 }
 

@@ -56,6 +56,7 @@ func NewGatewayRouter(s store.SandboxStore, cfg *config.APIConfig, reg registry.
 	mux.HandleFunc("POST /jobs", handleCreateJob(s, reg, cfg))
 	mux.HandleFunc("GET /jobs/{id}", jobProxy)
 	mux.HandleFunc("PUT /jobs/{id}/files", jobProxy)
+	mux.HandleFunc("POST /jobs/{id}/files/fetch", jobProxy)
 	mux.HandleFunc("POST /jobs/{id}/start", jobProxy)
 	mux.HandleFunc("GET /jobs/{id}/events", jobProxy)
 	mux.HandleFunc("GET /jobs/{id}/files/content", jobProxy)

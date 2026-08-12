@@ -66,6 +66,7 @@ func NewRouter(rt runnerruntime.Runtime, jobs JobManager, cfg *config.Config, re
 	mux.HandleFunc("POST /jobs", requireJobs(jobs, CreateJob(jobs)))
 	mux.HandleFunc("GET /jobs/{id}", requireJobs(jobs, GetJob(jobs)))
 	mux.HandleFunc("PUT /jobs/{id}/files", requireJobs(jobs, StageJobFile(jobs, cfg)))
+	mux.HandleFunc("POST /jobs/{id}/files/fetch", requireJobs(jobs, StageJobFileFromURL(jobs, cfg)))
 	mux.HandleFunc("POST /jobs/{id}/start", requireJobs(jobs, StartJob(jobs)))
 	mux.HandleFunc("GET /jobs/{id}/events", requireJobs(jobs, JobEvents(jobs)))
 	mux.HandleFunc("GET /jobs/{id}/files/content", requireJobs(jobs, JobOutputFile(jobs)))

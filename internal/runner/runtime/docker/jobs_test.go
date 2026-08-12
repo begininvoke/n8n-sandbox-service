@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -651,6 +653,115 @@ func TestStageJobFileRejectsOversizedBody(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(m.jobStagingDir(testJobID), "big.bin")); !os.IsNotExist(statErr) {
 		t.Fatalf("partial file left behind: %v", statErr)
+	}
+}
+
+// TestStageJobFileFromURLHappyPath uses httptest.NewServer (127.0.0.1), which
+// the real hardened client would refuse: it swaps in a permissive client, the
+// same seam a caller reaches for to test the happy path without depending on
+// egress to a real public host.
+func TestStageJobFileFromURLHappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("cat bytes"))
+	}))
+	defer srv.Close()
+
+	m := newJobRuntime(t, &fakeJobBackend{containerID: "container-job-fetch"})
+	m.fetchClient = &http.Client{}
+
+	if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+		t.Fatalf("CreateJob() failed: %v", err)
+	}
+
+	if err := m.StageJobFileFromURL(context.Background(), testJobID, "cat.jpg", srv.URL, 1024); err != nil {
+		t.Fatalf("StageJobFileFromURL() failed: %v", err)
+	}
+
+	staged := filepath.Join(m.jobStagingDir(testJobID), "cat.jpg")
+	data, err := os.ReadFile(staged)
+	if err != nil {
+		t.Fatalf("read staged file: %v", err)
+	}
+	if string(data) != "cat bytes" {
+		t.Fatalf("staged file = %q, want %q", data, "cat bytes")
+	}
+}
+
+func TestStageJobFileFromURLRejectsOversizedDownload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer srv.Close()
+
+	m := newJobRuntime(t, &fakeJobBackend{containerID: "container-job-fetch-big"})
+	m.fetchClient = &http.Client{}
+
+	if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+		t.Fatalf("CreateJob() failed: %v", err)
+	}
+
+	err := m.StageJobFileFromURL(context.Background(), testJobID, "cat.jpg", srv.URL, 4)
+	if !errors.Is(err, ErrJobFetchTooLarge) {
+		t.Fatalf("StageJobFileFromURL() error = %v, want ErrJobFetchTooLarge", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(m.jobStagingDir(testJobID), "cat.jpg")); !os.IsNotExist(statErr) {
+		t.Fatalf("partial file left behind: %v", statErr)
+	}
+}
+
+func TestStageJobFileFromURLMapsFetchFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	m := newJobRuntime(t, &fakeJobBackend{containerID: "container-job-fetch-fail"})
+	m.fetchClient = &http.Client{}
+
+	if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+		t.Fatalf("CreateJob() failed: %v", err)
+	}
+
+	err := m.StageJobFileFromURL(context.Background(), testJobID, "cat.jpg", srv.URL, 1024)
+	var fetchErr *JobFetchError
+	if !errors.As(err, &fetchErr) {
+		t.Fatalf("StageJobFileFromURL() error = %v, want *JobFetchError", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(m.jobStagingDir(testJobID), "cat.jpg")); !os.IsNotExist(statErr) {
+		t.Fatalf("partial file left behind: %v", statErr)
+	}
+}
+
+func TestStageJobFileFromURLRejectsBadInput(t *testing.T) {
+	m := newJobRuntime(t, &fakeJobBackend{containerID: "container-job-fetch-bad"})
+	if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+		t.Fatalf("CreateJob() failed: %v", err)
+	}
+
+	if err := m.StageJobFileFromURL(context.Background(), testJobID, "../etc/passwd", "https://example.com/x", 1024); err == nil {
+		t.Fatal("StageJobFileFromURL() accepted a traversing path")
+	}
+	if err := m.StageJobFileFromURL(context.Background(), testJobID, "ok.txt", "not-a-url", 1024); err == nil {
+		t.Fatal("StageJobFileFromURL() accepted a non-http(s) url")
+	}
+	if err := m.StageJobFileFromURL(context.Background(), "nope-nope-nope", "ok.txt", "https://example.com/x", 1024); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("StageJobFileFromURL() unknown job error = %v, want ErrJobNotFound", err)
+	}
+}
+
+func TestStageJobFileFromURLRequiresStaging(t *testing.T) {
+	m := newJobRuntime(t, &fakeJobBackend{containerID: "container-job-fetch-staging"})
+	if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+		t.Fatalf("CreateJob() failed: %v", err)
+	}
+	if _, err := m.StartJob(testJobID); err != nil {
+		t.Fatalf("StartJob() failed: %v", err)
+	}
+	waitForJobStatus(t, m, testJobID)
+
+	err := m.StageJobFileFromURL(context.Background(), testJobID, "cat.jpg", "https://example.com/cat.jpg", 1024)
+	if !errors.Is(err, ErrJobNotStaging) {
+		t.Fatalf("StageJobFileFromURL() after start error = %v, want ErrJobNotStaging", err)
 	}
 }
 
