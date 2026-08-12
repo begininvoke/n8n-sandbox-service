@@ -451,3 +451,41 @@ export function restartFirecrackerRunnerFromEnvFile(
 export function innerContainerName(sandboxID: string): string {
   return `sandbox-${sandboxID.slice(0, 12)}`;
 }
+
+// --- Jobs API helpers (raw apiRequest-based; no SDK dependency) ---
+
+/** POST /jobs. Returns the API-minted job id. */
+export async function createJob(request: APIRequestContext, spec: object): Promise<string> {
+  const res = await apiRequest(request, 'POST', '/jobs', { data: spec });
+  if (res.status !== 201) {
+    throw new Error(`createJob failed: ${res.status} ${res.body}`);
+  }
+  const body = (await res.json()) as { id: string };
+  return body.id;
+}
+
+/**
+ * POST /jobs/{id}/start. The response body is NDJSON streamed until the run
+ * finishes; splits on '\n', JSON.parses each line, and returns all events
+ * plus the terminal one ('exit' or 'error'). Unknown/intermediate event
+ * types (e.g. 'pulling', 'started') are tolerated and included in `events`.
+ */
+export async function startJobAndCollect(
+  request: APIRequestContext,
+  id: string,
+): Promise<{ events: any[]; exit: any }> {
+  const res = await apiRequest(request, 'POST', `/jobs/${id}/start`);
+  if (res.status !== 200) {
+    throw new Error(`startJob failed: ${res.status} ${res.body}`);
+  }
+  const events = res.body
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line));
+  const exit = events.find((e) => e.type === 'exit' || e.type === 'error');
+  if (!exit) {
+    throw new Error(`startJobAndCollect: no terminal event in stream: ${res.body}`);
+  }
+  return { events, exit };
+}
