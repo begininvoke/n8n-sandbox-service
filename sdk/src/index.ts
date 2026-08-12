@@ -1,5 +1,5 @@
 export { SandboxClient } from "./client";
-export { SandboxServiceError } from "./errors";
+export { SandboxServiceError, JobFileNotFoundError } from "./errors";
 export type {
   SandboxClientOptions,
   CreateSandboxOptions,
@@ -15,4 +15,8 @@ export type {
   CopyFileRequest,
   MoveFileRequest,
   DeleteFileOptions,
+  JobSpec,
+  JobRecord,
+  JobResult,
+  StartJobOptions,
 } from "./types";

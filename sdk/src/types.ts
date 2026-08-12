@@ -105,6 +105,59 @@ export interface ExecResult {
 /** Accepted content types for file write operations. */
 export type FileContent = string | Buffer | Uint8Array;
 
+/** Specification for a one-shot job container. Also serves as `createJob`'s options. */
+export interface JobSpec {
+  /** Docker image to run. */
+  image: string;
+  /** Command to run, overriding the image's default CMD. */
+  cmd?: string[];
+  /** Environment variables to set in the container. */
+  env?: Record<string, string>;
+  /** Maximum execution time in milliseconds. Service default 300000; max 900000. */
+  timeoutMs?: number;
+}
+
+/** Metadata for a job instance. */
+export interface JobRecord {
+  id: string;
+  status: "staging" | "running" | "exited" | "error";
+  image: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  error: string | null;
+  /** Unix timestamp (seconds) when the job was created. */
+  createdAt: number;
+  /** Unix timestamp (seconds) when the job started running, or null. */
+  startedAt: number | null;
+  /** Unix timestamp (seconds) when the job finished, or null. */
+  finishedAt: number | null;
+}
+
+/** Aggregated result of a completed job run. */
+export interface JobResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /** Wall-clock execution time in milliseconds. */
+  executionTimeMs: number;
+  /** Whether the job was killed due to timeout. */
+  timedOut: boolean;
+  /** Whether the job was terminated by a signal. */
+  killed: boolean;
+  /** True when exitCode is 0 and the job didn't time out. */
+  success: boolean;
+}
+
+/** Options for starting a job. */
+export interface StartJobOptions {
+  /** Called with each chunk of stdout data as it arrives. */
+  onStdout?: (data: string) => void;
+  /** Called with each chunk of stderr data as it arrives. */
+  onStderr?: (data: string) => void;
+  /** Signal to abort the streaming request. */
+  abortSignal?: AbortSignal;
+}
+
 /** Options for listing files in a sandbox directory. */
 export interface ListFilesOptions {
   /** Directory path to list. Defaults to root. */
@@ -164,13 +217,28 @@ export type FileStatWireResponse = {
   modified_at: string;
 };
 
-/** Initial event emitted at the start of every exec stream. */
-export type ExecStartedEvent = { type: "started"; seq: number; exec_id: string };
-/** Streamed stdout chunk from exec. */
+export type JobWireResponse = {
+  id: string;
+  status: "staging" | "running" | "exited" | "error";
+  image: string;
+  exit_code: number | null;
+  timed_out: boolean;
+  error: string | null;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+};
+
+/**
+ * Initial event emitted at the start of every exec/job stream. The server MAY include
+ * `exec_id` (always does for exec; jobs' `started` omits it) — treat it as optional.
+ */
+export type ExecStartedEvent = { type: "started"; seq: number; exec_id?: string };
+/** Streamed stdout chunk. */
 export type ExecStdoutEvent = { type: "stdout"; data: string; seq: number };
-/** Streamed stderr chunk from exec. */
+/** Streamed stderr chunk. */
 export type ExecStderrEvent = { type: "stderr"; data: string; seq: number };
-/** Final exit event from exec with process metadata. */
+/** Final exit event with process metadata. */
 export type ExecExitEvent = {
   type: "exit";
   exit_code: number;
@@ -180,12 +248,33 @@ export type ExecExitEvent = {
   killed: boolean;
   seq: number;
 };
-/** Error event — may originate from the server (with seq) or from client-side parsing (without). */
+/**
+ * Error event — exec stream shape: a human-readable message. May originate from the server
+ * (with seq) or from client-side parsing (without).
+ */
 export type ExecErrorEvent = { type: "error"; error: string; seq?: number };
-/** Discriminated union of all NDJSON exec stream events. */
+/** Error event — jobs stream shape: a string error code plus a message (contract v1). */
+export type JobErrorEvent = {
+  type: "error";
+  code: "image_pull_failed" | "internal";
+  data: string;
+  seq: number;
+};
+/** Emitted before a job's image pull starts (jobs only; exec never emits this). */
+export type ExecPullingEvent = { type: "pulling"; data: string; seq: number };
+/**
+ * A well-formed event (`seq` + `type`) whose `type` this SDK version doesn't recognize yet.
+ * Always safe to ignore — never treated as terminal, so a future server-side event type can't
+ * kill an in-flight stream.
+ */
+export type ExecUnknownEvent = { type: "unknown"; seq: number };
+/** Discriminated union of all NDJSON exec/job stream events. */
 export type ExecEvent =
   | ExecStartedEvent
   | ExecStdoutEvent
   | ExecStderrEvent
   | ExecExitEvent
-  | ExecErrorEvent;
+  | ExecErrorEvent
+  | JobErrorEvent
+  | ExecPullingEvent
+  | ExecUnknownEvent;

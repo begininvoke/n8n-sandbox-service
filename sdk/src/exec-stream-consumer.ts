@@ -28,6 +28,8 @@ export class ExecStreamConsumer {
   lastSeq = -1;
   exitMeta: ExitMeta | null = null;
   execError: string | undefined;
+  /** String error code from a jobs-shaped error event (`code`+`data`); undefined for exec's plain-message shape. */
+  execErrorCode: string | number | undefined;
 
   constructor(
     private readonly onStdout?: (data: string) => void,
@@ -53,6 +55,12 @@ export class ExecStreamConsumer {
       switch (event.type) {
         case "started":
           break;
+        case "pulling":
+          // Jobs-only pre-pull notice; nothing to accumulate.
+          break;
+        case "unknown":
+          // Well-formed event of a type this SDK doesn't recognize yet; safe to ignore.
+          break;
         case "stdout":
           this.stdout += event.data;
           this.onStdout?.(event.data);
@@ -71,7 +79,9 @@ export class ExecStreamConsumer {
           };
           break;
         case "error":
-          this.execError = event.error;
+          // Two wire shapes share this type: exec's `error` message, jobs' `code` + `data`.
+          this.execError = "error" in event ? event.error : event.data;
+          this.execErrorCode = "code" in event ? event.code : undefined;
           return;
       }
     }
@@ -79,8 +89,8 @@ export class ExecStreamConsumer {
 
   /** Returns the aggregated result, or throws if the stream ended abnormally. */
   result(): ExecResult {
-    if (this.execError) {
-      throw new SandboxServiceError(this.execError, 0);
+    if (this.execError !== undefined) {
+      throw new SandboxServiceError(this.execError, 0, this.execErrorCode);
     }
     if (!this.exitMeta) {
       throw new SandboxServiceError("Sandbox exec stream ended without an exit event", 0);

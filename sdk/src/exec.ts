@@ -4,8 +4,9 @@ import { ExecStreamConsumer } from "./exec-stream-consumer";
 import type { HttpClient } from "./http";
 import type { ExecRequest, ExecResult } from "./types";
 
-const MAX_RESUME_RETRIES = 10;
-const RESUME_DELAY_MS = 250;
+// Exported for reuse by jobs.ts's start/resume loop (same transient-retry contract).
+export const MAX_RESUME_RETRIES = 10;
+export const RESUME_DELAY_MS = 250;
 const TRANSIENT_ERROR_CODES = new Set([
   "ECONNRESET",
   "ECONNREFUSED",
@@ -115,7 +116,7 @@ export async function deleteExecution(
   await http.requestVoid("DELETE", `/sandboxes/${sandboxId}/executions/${execId}`);
 }
 
-function isTransientError(error: unknown): boolean {
+export function isTransientError(error: unknown): boolean {
   if (error instanceof InvalidStreamEventError) {
     return true;
   }
@@ -132,6 +133,6 @@ function isTransientError(error: unknown): boolean {
   return false;
 }
 
-function delay(ms: number): Promise<void> {
+export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
