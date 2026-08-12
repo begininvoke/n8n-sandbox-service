@@ -18,6 +18,7 @@ const (
 	containerLabelManaged    = "sandbox-service.managed"
 	containerLabelManagedVal = "true"
 	containerLabelSandboxID  = "sandbox-service.id"
+	containerLabelJobID      = "sandbox-service.job-id"
 )
 
 type containerInspect struct {
@@ -40,6 +41,7 @@ type containerState struct {
 	Paused     bool   `json:"Paused"`
 	Restarting bool   `json:"Restarting"`
 	Dead       bool   `json:"Dead"`
+	ExitCode   int    `json:"ExitCode"`
 }
 
 type networkInspect struct {
@@ -65,6 +67,11 @@ type dockerBackend interface {
 	findContainerByLabels(ctx context.Context, filterArgs ...string) ([]string, error)
 	pullImage(ctx context.Context, image string) error
 	run(ctx context.Context, args ...string) (string, error)
+	createJobContainer(ctx context.Context, jobID, containerName, image string, cmd []string, env map[string]string, limits *ResourceLimits, enableCgroups bool) (string, error)
+	copyToContainer(ctx context.Context, localPath, containerID, destPath string) error
+	copyFromContainer(ctx context.Context, containerID, srcPath string) ([]byte, error)
+	startAttached(ctx context.Context, containerID string) (stdout, stderr io.ReadCloser, wait func() error, err error)
+	killContainer(ctx context.Context, containerID string) error
 }
 
 // dockerClient is a thin wrapper around the docker CLI. It is the only place
@@ -223,6 +230,72 @@ func (dc *dockerClient) findContainerByLabels(ctx context.Context, filterArgs ..
 		return nil, nil
 	}
 	return lines, nil
+}
+
+func (dc *dockerClient) createJobContainer(ctx context.Context, jobID, containerName, image string, cmd []string, env map[string]string, limits *ResourceLimits, enableCgroups bool) (string, error) {
+	args := []string{
+		"container", "create",
+		"--name", containerName,
+		"--restart", "no", // one-shot; NOT unless-stopped
+		"--network", runnerBridgeNetwork,
+		"--label", containerLabelJobID + "=" + jobID, // NOT containerLabelManaged (reconcile nukes it)
+		"--sysctl", "net.ipv6.conf.all.disable_ipv6=1",
+		"--sysctl", "net.ipv6.conf.default.disable_ipv6=1",
+		"--sysctl", "net.ipv6.conf.lo.disable_ipv6=1",
+		// no --user, no --env HOME/PATH: the image's own user/entrypoint/env run as-is
+	}
+	for k, v := range env {
+		args = append(args, "--env", k+"="+v)
+	}
+	if enableCgroups {
+		args = append(args, dockerLimitArgs(limits)...)
+	}
+	args = append(args, dockerDiskQuotaArgs(limits)...)
+	args = append(args, image)
+	args = append(args, cmd...) // empty slice → image CMD applies
+	out, err := dc.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (dc *dockerClient) copyToContainer(ctx context.Context, localPath, containerID, destPath string) error {
+	// docker CLI runs on the runner host where the staging dir lives; plain path copy, no tar-stdin needed.
+	_, err := dc.run(ctx, "cp", localPath, containerID+":"+destPath)
+	return err
+}
+
+func (dc *dockerClient) copyFromContainer(ctx context.Context, containerID, srcPath string) ([]byte, error) {
+	// Buffered (outputs are ≤ file-cap sized for the PoC); "-" emits a tar stream on stdout.
+	out, err := dc.run(ctx, "cp", containerID+":"+srcPath, "-")
+	if err != nil {
+		return nil, err
+	}
+	return []byte(out), nil
+}
+
+func (dc *dockerClient) startAttached(ctx context.Context, containerID string) (io.ReadCloser, io.ReadCloser, func() error, error) {
+	// start -a: starts, attaches both streams, exits with the container's exit code.
+	cmd := exec.CommandContext(ctx, "docker", "start", "-a", containerID)
+	cmd.Env = append(os.Environ(), "DOCKER_HOST="+dc.host)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, nil, err
+	}
+	return stdout, stderr, cmd.Wait, nil
+}
+
+func (dc *dockerClient) killContainer(ctx context.Context, containerID string) error {
+	_, err := dc.run(ctx, "kill", containerID)
+	return err
 }
 
 func (dc *dockerClient) pullImage(ctx context.Context, image string) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"testing"
 
@@ -75,6 +76,26 @@ func (f *fakeDockerBackend) pullImage(context.Context, string) error {
 
 func (f *fakeDockerBackend) run(context.Context, ...string) (string, error) {
 	return "", errors.New("unexpected run")
+}
+
+func (f *fakeDockerBackend) createJobContainer(context.Context, string, string, string, []string, map[string]string, *ResourceLimits, bool) (string, error) {
+	return "", errors.New("unexpected createJobContainer")
+}
+
+func (f *fakeDockerBackend) copyToContainer(context.Context, string, string, string) error {
+	return errors.New("unexpected copyToContainer")
+}
+
+func (f *fakeDockerBackend) copyFromContainer(context.Context, string, string) ([]byte, error) {
+	return nil, errors.New("unexpected copyFromContainer")
+}
+
+func (f *fakeDockerBackend) startAttached(context.Context, string) (io.ReadCloser, io.ReadCloser, func() error, error) {
+	return nil, nil, nil, errors.New("unexpected startAttached")
+}
+
+func (f *fakeDockerBackend) killContainer(context.Context, string) error {
+	return errors.New("unexpected killContainer")
 }
 
 func TestDockerLimitArgs(t *testing.T) {
