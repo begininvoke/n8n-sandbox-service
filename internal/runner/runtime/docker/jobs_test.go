@@ -43,6 +43,10 @@ type fakeJobBackend struct {
 	// killContainer closes them, standing in for a container that never exits.
 	holdStreams bool
 	streamWs    []io.Closer
+
+	// pullEntered is closed when pullImage starts; pullGate blocks it until closed.
+	pullEntered chan struct{}
+	pullGate    chan struct{}
 }
 
 func (f *fakeJobBackend) record(name string) {
@@ -106,6 +110,13 @@ func (f *fakeJobBackend) findContainerByLabels(context.Context, ...string) ([]st
 
 func (f *fakeJobBackend) pullImage(context.Context, string) error {
 	f.record("pull")
+	// Lets a test act (e.g. delete the job) while the pull is still in flight.
+	if f.pullEntered != nil {
+		close(f.pullEntered)
+	}
+	if f.pullGate != nil {
+		<-f.pullGate
+	}
 	return f.pullErr
 }
 
@@ -192,6 +203,40 @@ func waitForJobStatus(t *testing.T, m *Runtime, id string) *JobRecord {
 	}
 	t.Fatalf("job %s never finished", id)
 	return nil
+}
+
+// waitFor polls cond until it holds, for assertions on background goroutines
+// that leave no record behind to poll via GetJob.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// recordTeardowns captures the container IDs whose network rules were removed.
+func recordTeardowns(m *Runtime) chan string {
+	torn := make(chan string, 8)
+	m.teardownRules = func(containerID string) error {
+		torn <- containerID
+		return nil
+	}
+	return torn
+}
+
+func terminalEvents(events []daemon.Response) []daemon.Response {
+	var terminal []daemon.Response
+	for _, e := range events {
+		if e.Type == daemon.ResponseTypeExit || e.Type == daemon.ResponseTypeError {
+			terminal = append(terminal, e)
+		}
+	}
+	return terminal
 }
 
 func decodeEvents(t *testing.T, ex *daemon.Execution) []daemon.Response {
@@ -365,6 +410,153 @@ func TestJobImagePullFailureIsTerminal(t *testing.T) {
 	// A job that failed before its container existed still cleans up.
 	if err := m.DeleteJob(context.Background(), testJobID); err != nil {
 		t.Fatalf("DeleteJob() failed: %v", err)
+	}
+}
+
+// A delete that lands while the image is still pulling reads an empty container
+// ID, so the run goroutine must clean up the container it goes on to create.
+// Otherwise it is orphaned: no record for the reaper, no managed label for boot
+// reconciliation, and its name prefix blocks later jobs.
+func TestDeleteJobDuringImagePullRemovesTheRacedContainer(t *testing.T) {
+	backend := &fakeJobBackend{
+		containerID: "container-job-raced",
+		pullEntered: make(chan struct{}),
+		pullGate:    make(chan struct{}),
+	}
+	m := newJobRuntime(t, backend)
+	torn := recordTeardowns(m)
+
+	if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+		t.Fatalf("CreateJob() failed: %v", err)
+	}
+	ex, err := m.StartJob(testJobID)
+	if err != nil {
+		t.Fatalf("StartJob() failed: %v", err)
+	}
+
+	<-backend.pullEntered
+	if err := m.DeleteJob(context.Background(), testJobID); err != nil {
+		t.Fatalf("DeleteJob() during pull failed: %v", err)
+	}
+	close(backend.pullGate)
+
+	waitFor(t, "the raced container to be removed", func() bool {
+		backend.mu.Lock()
+		defer backend.mu.Unlock()
+		return backend.removedID == "container-job-raced"
+	})
+	select {
+	case got := <-torn:
+		if got != "container-job-raced" {
+			t.Fatalf("teardownRules containerID = %q, want container-job-raced", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("network rules were never torn down for the raced container")
+	}
+
+	wantCalls := []string{"pull", "createJob", "removeContainer"}
+	if got := backend.recorded(); !reflect.DeepEqual(got, wantCalls) {
+		t.Fatalf("docker calls = %v, want %v", got, wantCalls)
+	}
+
+	// The record is gone, so the run goroutine must not report a lifecycle it no
+	// longer owns.
+	if got := terminalEvents(decodeEvents(t, ex)); len(got) != 0 {
+		t.Fatalf("terminal events = %+v, want none after delete", got)
+	}
+	if _, err := m.GetJob(testJobID); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("GetJob() error = %v, want ErrJobNotFound", err)
+	}
+}
+
+// An errored job never reaches `exited`, so its outputs are unfetchable: any
+// container already created is removed instead of waiting for the reaper.
+func TestJobInternalFailureIsTerminalAndCleansUpContainer(t *testing.T) {
+	const containerID = "container-job-internal"
+	tests := []struct {
+		name          string
+		createErr     error
+		copyToErr     error
+		startErr      error
+		wantCalls     []string
+		wantTeardown  bool
+		wantErrorText string
+	}{
+		{
+			name:          "create fails",
+			createErr:     errors.New("cgroup setup refused"),
+			wantCalls:     []string{"pull", "createJob"},
+			wantErrorText: "cgroup setup refused",
+		},
+		{
+			name:          "staging copy fails",
+			copyToErr:     errors.New("cp: permission denied"),
+			wantCalls:     []string{"pull", "createJob", "cp", "removeContainer"},
+			wantTeardown:  true,
+			wantErrorText: "cp: permission denied",
+		},
+		{
+			name:          "attach fails",
+			startErr:      errors.New("attach refused"),
+			wantCalls:     []string{"pull", "createJob", "cp", "startAttached", "removeContainer"},
+			wantTeardown:  true,
+			wantErrorText: "attach refused",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &fakeJobBackend{
+				containerID: containerID,
+				createErr:   tc.createErr,
+				copyToErr:   tc.copyToErr,
+				startErr:    tc.startErr,
+			}
+			m := newJobRuntime(t, backend)
+			torn := recordTeardowns(m)
+
+			if _, err := m.CreateJob(testJobID, JobSpec{Image: "alpine:3.20"}); err != nil {
+				t.Fatalf("CreateJob() failed: %v", err)
+			}
+			ex, err := m.StartJob(testJobID)
+			if err != nil {
+				t.Fatalf("StartJob() failed: %v", err)
+			}
+
+			final := waitForJobStatus(t, m, testJobID)
+			if final.Status != jobStatusError || final.Error == nil || *final.Error != tc.wantErrorText {
+				t.Fatalf("final record = %+v, want error status carrying %q", final, tc.wantErrorText)
+			}
+			if final.ExitCode != nil || final.TimedOut {
+				t.Fatalf("final record = %+v, want no exit code and timed_out false", final)
+			}
+
+			terminal := terminalEvents(decodeEvents(t, ex))
+			if len(terminal) != 1 {
+				t.Fatalf("terminal events = %+v, want exactly one", terminal)
+			}
+			last := terminal[0]
+			if last.Type != daemon.ResponseTypeError || last.Code != jobErrorCodeInternal || last.Data != tc.wantErrorText {
+				t.Fatalf("terminal event = %+v, want %s code with %q", last, jobErrorCodeInternal, tc.wantErrorText)
+			}
+
+			if got := backend.recorded(); !reflect.DeepEqual(got, tc.wantCalls) {
+				t.Fatalf("docker calls = %v, want %v", got, tc.wantCalls)
+			}
+			select {
+			case got := <-torn:
+				if !tc.wantTeardown {
+					t.Fatalf("network rules torn down for %q, want no teardown", got)
+				}
+				if got != containerID {
+					t.Fatalf("teardownRules containerID = %q, want %q", got, containerID)
+				}
+			default:
+				if tc.wantTeardown {
+					t.Fatal("network rules were never torn down")
+				}
+			}
+		})
 	}
 }
 

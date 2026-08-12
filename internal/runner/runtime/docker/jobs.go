@@ -94,6 +94,9 @@ type job struct {
 	exitCode    *int
 	timedOut    bool
 	errMsg      *string
+	// deleted is set by DeleteJob so the run goroutine can tell that the record
+	// it is working on is gone.
+	deleted bool
 
 	createdAt  int64
 	startedAt  int64 // 0 = unset
@@ -284,21 +287,20 @@ func (m *Runtime) DeleteJob(ctx context.Context, id string) error {
 	delete(m.jobs, id)
 	m.jobsMu.Unlock()
 
+	// Marking the job deleted under the same lock that publishes the container ID
+	// is what makes the handoff safe: either the ID is already visible here and
+	// this call removes the container, or runJob sees the flag right after
+	// creating it and cleans up itself. Otherwise a delete during a cold-image
+	// pull would orphan the container with no record and no managed label, so
+	// neither the reaper nor boot reconciliation would ever collect it.
 	j.mu.Lock()
+	j.deleted = true
 	containerID, stagingDir := j.containerID, j.stagingDir
 	j.mu.Unlock()
 
 	var firstErr error
 	if containerID != "" {
-		// Order matches sandbox teardown: rules must outlive the container so it
-		// cannot run unconfined while being removed.
-		if err := m.docker.removeContainer(ctx, containerID); err != nil {
-			slog.Warn("remove job container", "job_id", id, "container_id", containerID, "err", err)
-			firstErr = err
-		}
-		if err := m.teardownRules(containerID); err != nil {
-			slog.Warn("teardown job network rules", "job_id", id, "container_id", containerID, "err", err)
-		}
+		firstErr = m.removeJobContainer(ctx, id, containerID)
 	}
 	if err := os.RemoveAll(stagingDir); err != nil {
 		slog.Warn("remove job staging dir", "job_id", id, "err", err)
@@ -311,6 +313,21 @@ func (m *Runtime) DeleteJob(ctx context.Context, id string) error {
 	return firstErr
 }
 
+// removeJobContainer removes a job container and then its network rules. Order
+// matters: rules must outlive the container so it cannot run unconfined during
+// teardown. Both failures are logged; only the removal error is returned.
+func (m *Runtime) removeJobContainer(ctx context.Context, jobID, containerID string) error {
+	var err error
+	if removeErr := m.docker.removeContainer(ctx, containerID); removeErr != nil {
+		slog.Warn("remove job container", "job_id", jobID, "container_id", containerID, "err", removeErr)
+		err = removeErr
+	}
+	if teardownErr := m.teardownRules(containerID); teardownErr != nil {
+		slog.Warn("teardown job network rules", "job_id", jobID, "container_id", containerID, "err", teardownErr)
+	}
+	return err
+}
+
 // runJob drives one job container to completion and pushes its lifecycle onto
 // the event log. It runs on a detached context: the job outlives the HTTP
 // request that started it, so one caller disconnecting must not kill it.
@@ -321,6 +338,11 @@ func (m *Runtime) runJob(j *job, ex *daemon.Execution) {
 	// Job error events carry the machine code in `code` and the message in
 	// `data`; `error` is the exec-stream shape and stays unset here.
 	fail := func(code, msg string) {
+		// An errored job never reaches the `exited` state, so its outputs are
+		// unfetchable: drop the container now rather than parking it for the reaper.
+		if containerID := j.currentContainerID(); containerID != "" {
+			_ = m.removeJobContainer(ctx, j.id, containerID)
+		}
 		ex.Append(daemon.Response{Type: daemon.ResponseTypeError, Code: code, Data: msg})
 		j.finish(jobStatusError, nil, false, &msg)
 	}
@@ -350,7 +372,14 @@ func (m *Runtime) runJob(j *job, ex *daemon.Execution) {
 		fail(jobErrorCodeInternal, err.Error())
 		return
 	}
-	j.setContainerID(containerID)
+	if !j.setContainerIDIfLive(containerID) {
+		// DeleteJob got here first and saw no container ID, so it could not remove
+		// this one: ownership of the cleanup falls to us. The job record is already
+		// gone, so no further events are emitted.
+		slog.Info("removing job container created after delete", "job_id", j.id, "container_id", containerID)
+		_ = m.removeJobContainer(ctx, j.id, containerID)
+		return
+	}
 
 	// The trailing "/." copies the staged contents into /n8n rather than nesting
 	// them under /n8n/<jobID> when the image already has a /n8n.
@@ -517,10 +546,24 @@ func (j *job) snapshotSpec() JobSpec {
 	return j.spec
 }
 
-func (j *job) setContainerID(containerID string) {
+// setContainerIDIfLive publishes the container ID unless the job was deleted
+// meanwhile, reporting whether the caller still owns the run. Both this and
+// DeleteJob's read happen under j.mu, so exactly one of them ends up
+// responsible for removing the container.
+func (j *job) setContainerIDIfLive(containerID string) bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.deleted {
+		return false
+	}
 	j.containerID = containerID
+	return true
+}
+
+func (j *job) currentContainerID() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.containerID
 }
 
 func (j *job) markTimedOut() {
