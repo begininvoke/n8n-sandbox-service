@@ -7,9 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/n8n-io/sandbox-service/internal/daemon"
 	"github.com/n8n-io/sandbox-service/internal/runner/config"
 	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
 	"github.com/n8n-io/sandbox-service/internal/runner/runtime/docker/netrules"
@@ -55,6 +57,10 @@ type Runtime struct {
 	waitForDaemon func(ctx context.Context, baseURL string) error
 	imageReady    atomic.Bool
 	imageReadyCh  chan struct{}
+
+	jobsMu   sync.Mutex
+	jobs     map[string]*job
+	jobExecs *daemon.ExecManager
 }
 
 var _ runnerruntime.Runtime = (*Runtime)(nil)
@@ -77,6 +83,8 @@ func New(runnerConfig *config.Config, cfg Config) (*Runtime, error) {
 	}
 	m.gatewayIP = gatewayIP
 
+	go m.jobReaperLoop()
+
 	return m, nil
 }
 
@@ -91,6 +99,8 @@ func newRuntime(runnerConfig *config.Config, cfg Config, docker dockerBackend) *
 		teardownRules: netrules.Teardown,
 		waitForDaemon: waitForDaemon,
 		imageReadyCh:  make(chan struct{}),
+		jobs:          make(map[string]*job),
+		jobExecs:      daemon.NewExecManager(),
 	}
 }
 

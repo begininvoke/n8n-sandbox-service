@@ -70,8 +70,12 @@ type Response struct {
 	// ExecID identifies the exec session (set when Type == "session").
 	ExecID string `json:"exec_id,omitempty"`
 
-	// Data carries string output for stdout/stderr/result responses.
+	// Data carries string output for stdout/stderr/result responses, and the
+	// human-readable message on a job error event.
 	Data string `json:"data,omitempty"`
+
+	// Code is a machine-readable failure code on a job error event.
+	Code string `json:"code,omitempty"`
 
 	// ExitCode is set when Type == "exit".
 	ExitCode int `json:"exit_code"`
