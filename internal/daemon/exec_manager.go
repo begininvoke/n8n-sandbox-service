@@ -144,6 +144,7 @@ func (em *ExecManager) NewExternal(execID string) *Execution {
 	ex := &Execution{
 		ID:            execID,
 		maxEventBytes: em.maxEventBytes,
+		cancel:        func() {}, // no-op for externally-driven executions
 		notify:        make(chan struct{}),
 	}
 	em.executions[execID] = ex

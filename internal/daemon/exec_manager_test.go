@@ -135,6 +135,30 @@ func TestExecutionDeleteNotFound(t *testing.T) {
 	}
 }
 
+func TestNewExternalAppendAndDelete(t *testing.T) {
+	em := NewExecManager()
+	defer em.Close()
+
+	ex := em.NewExternal("external-exec-1")
+	if ex == nil {
+		t.Fatal("NewExternal returned nil")
+	}
+
+	// Append a terminal event
+	exitResp := Response{Type: ResponseTypeExit, ExitCode: 0}
+	ex.Append(exitResp)
+
+	// Verify Delete does not panic (regression test for nil cancel func)
+	deleted := em.Delete("external-exec-1")
+	if !deleted {
+		t.Fatal("expected Delete to return true for external execution")
+	}
+
+	if em.Get("external-exec-1") != nil {
+		t.Fatal("expected external execution to be removed after Delete")
+	}
+}
+
 func TestExecutionResumeReturnsNoDuplicates(t *testing.T) {
 	handler := NewHandler()
 	t.Cleanup(handler.Close)
