@@ -180,3 +180,46 @@ func TestCreateJobHappyPathAndProxy(t *testing.T) {
 		t.Fatalf("expected %d after delete, got %d (body: %s)", http.StatusNotFound, afterDeleteRR.Code, afterDeleteRR.Body.String())
 	}
 }
+
+func TestJobProxyRunnerUnavailableReturnsStringCode(t *testing.T) {
+	s, err := store.New(":memory:")
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	jobID := generateUUID()
+	// Nothing listens on this address, so the reverse proxy's dial fails and
+	// its ErrorHandler runs.
+	if err := s.CreateJobRouting(&store.JobRoutingRecord{
+		ID:             jobID,
+		RunnerHTTPBase: "http://127.0.0.1:1",
+		CreatedAt:      time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("seed job routing: %v", err)
+	}
+
+	router, err := NewGatewayRouter(s, &config.APIConfig{
+		APIKeys:      map[string]struct{}{"public-key": {}},
+		RunnerAPIKey: "runner-key",
+		MaxFileBytes: 1024,
+	}, registry.New(45*time.Second), metrics.NewAPIRecorder(false))
+	if err != nil {
+		t.Fatalf("create gateway router: %v", err)
+	}
+
+	rr := doJobRequest(router, http.MethodGet, "/jobs/"+jobID, "")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected %d, got %d (body: %s)", http.StatusServiceUnavailable, rr.Code, rr.Body.String())
+	}
+
+	// Unmarshaling Code as a string (not the sandbox endpoints' int) fails
+	// the test if the shared proxy ErrorHandler's int-code shape leaks through.
+	var got jobError
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("expected a string code field, got body %s: %v", rr.Body.String(), err)
+	}
+	if got.Code != "runner_unavailable" {
+		t.Fatalf("expected code runner_unavailable, got %q (body: %s)", got.Code, rr.Body.String())
+	}
+}

@@ -221,6 +221,21 @@ func jobProxyHandler(s store.SandboxStore, cfg *config.APIConfig) http.HandlerFu
 			return
 		}
 		proxy := newRunnerReverseProxy(u, cfg.RunnerAPIKey, nil)
+		// newRunnerReverseProxy's default ErrorHandler writes the sandbox
+		// int-code error shape; jobs need the frozen string-code shape, so
+		// override it here rather than touching the shared helper.
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeJobError(w, http.StatusBadRequest, "invalid_request", "failed to read request body: "+maxBytesErr.Error())
+				return
+			}
+			if strings.Contains(err.Error(), "request body too large") {
+				writeJobError(w, http.StatusBadRequest, "invalid_request", "failed to read request body: http: request body too large")
+				return
+			}
+			writeJobError(w, http.StatusServiceUnavailable, "runner_unavailable", "runner unavailable")
+		}
 		proxy.ServeHTTP(w, r)
 
 		if r.Method == http.MethodDelete {
