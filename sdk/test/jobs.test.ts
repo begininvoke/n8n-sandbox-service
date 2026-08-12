@@ -154,6 +154,17 @@ describe("SandboxClient jobs CRUD", () => {
     });
   });
 
+  it("stageJobFileFromURL sends POST /jobs/{id}/files/fetch with path and url", async () => {
+    const http = withMockHttp(client);
+    http.requestVoid.mockResolvedValue(undefined);
+
+    await client.stageJobFileFromURL("job-1", "cat.jpg", "https://cataas.com/cat/abc");
+
+    expect(http.requestVoid).toHaveBeenCalledWith("POST", "/jobs/job-1/files/fetch", {
+      data: { path: "cat.jpg", url: "https://cataas.com/cat/abc" },
+    });
+  });
+
   it("getJob sends GET /jobs/{id} and maps nullable fields", async () => {
     const http = withMockHttp(client);
     http.requestJson.mockResolvedValue({

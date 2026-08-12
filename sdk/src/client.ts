@@ -14,6 +14,7 @@ import { HttpClient } from "./http";
 import {
   createJob,
   stageJobFile,
+  stageJobFileFromURL,
   startJob,
   resumeJobEvents,
   getJob,
@@ -186,6 +187,13 @@ export class SandboxClient {
    */
   async stageJobFile(id: string, path: string, data: FileContent): Promise<void> {
     return stageJobFile(this.http, id, path, data);
+  }
+
+  /**
+   * Stages a job input file by having the runner download it from a URL server-side.
+   */
+  async stageJobFileFromURL(id: string, path: string, url: string): Promise<void> {
+    return stageJobFileFromURL(this.http, id, path, url);
   }
 
   /**

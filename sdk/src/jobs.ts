@@ -38,6 +38,22 @@ export async function stageJobFile(
 }
 
 /**
+ * Stages a job input file by having the runner download `url` server-side, saving the
+ * caller a download-then-reupload round trip for inputs that are already reachable by URL
+ * (e.g. a binary referenced by a workflow item).
+ */
+export async function stageJobFileFromURL(
+  http: HttpClient,
+  id: string,
+  path: string,
+  url: string,
+): Promise<void> {
+  await http.requestVoid("POST", `/jobs/${id}/files/fetch`, {
+    data: { path, url },
+  });
+}
+
+/**
  * Starts a job and streams its output. The job id pre-exists (created via `createJob`), so
  * unlike `exec`'s two-phase loop there's no client-side idempotency key to retry the initial
  * POST with: a single start attempt is made, and any resume after that goes through
