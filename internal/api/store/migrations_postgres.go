@@ -61,3 +61,11 @@ const postgresAddTenantIDCol = `ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS t
 
 // Backfill legacy empty tenant_id to the admin sentinel.
 const postgresBackfillAdminTenantID = `UPDATE sandboxes SET tenant_id = '__admin__' WHERE tenant_id = ''`
+
+const postgresJobsSchema = `
+CREATE TABLE IF NOT EXISTS jobs (
+	id                    TEXT PRIMARY KEY,
+	runner_http_base_url  TEXT NOT NULL,
+	created_at            BIGINT NOT NULL
+);
+`

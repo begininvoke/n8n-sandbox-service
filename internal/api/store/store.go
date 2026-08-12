@@ -73,6 +73,14 @@ type APIKey struct {
 	RevokedAt int64 // 0 = active
 }
 
+// JobRoutingRecord pins a job id to the runner that is executing it, so later
+// /jobs/{id}/* requests know which runner to proxy to.
+type JobRoutingRecord struct {
+	ID             string
+	RunnerHTTPBase string
+	CreatedAt      int64
+}
+
 // SandboxStore exposes CRUD operations for SandboxRecord rows and tenant keys.
 type SandboxStore interface {
 	io.Closer
@@ -103,6 +111,10 @@ type SandboxStore interface {
 	ListAPIKeysByTenant(tenantID string) ([]*APIKey, error)
 	ListActiveAPIKeysByPrefix(prefix string) ([]*APIKey, error)
 	RevokeAPIKey(id string) error
+
+	CreateJobRouting(rec *JobRoutingRecord) error
+	GetJobRouting(id string) (*JobRoutingRecord, error)
+	DeleteJobRouting(id string) error
 }
 
 // scanner is the common interface satisfied by both *sql.Row and *sql.Rows.
@@ -153,4 +165,13 @@ func scanAPIKey(row scanner) (*APIKey, error) {
 		k.RevokedAt = *revokedAt
 	}
 	return &k, nil
+}
+
+func scanJobRouting(row scanner) (*JobRoutingRecord, error) {
+	var j JobRoutingRecord
+	err := row.Scan(&j.ID, &j.RunnerHTTPBase, &j.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &j, nil
 }

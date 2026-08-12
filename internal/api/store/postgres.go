@@ -59,6 +59,11 @@ func NewPostgres(cfg config.PostgresConfig) (*PostgresStore, error) {
 		return nil, fmt.Errorf("store: run tenants schema: %w", err)
 	}
 
+	if _, err := db.Exec(postgresJobsSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: run jobs schema: %w", err)
+	}
+
 	lockDB, err := sql.Open("pgx", cfg.DSN())
 	if err != nil {
 		_ = db.Close()
@@ -429,6 +434,33 @@ func (s *PostgresStore) RevokeAPIKey(id string) error {
 	now := time.Now().Unix()
 	if _, err := s.db.Exec(`UPDATE api_keys SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL`, now, id); err != nil {
 		return fmt.Errorf("store: revoke api key %s: %w", id, err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) CreateJobRouting(rec *JobRoutingRecord) error {
+	const q = `INSERT INTO jobs (id, runner_http_base_url, created_at) VALUES ($1, $2, $3)`
+	if _, err := s.db.Exec(q, rec.ID, rec.RunnerHTTPBase, rec.CreatedAt); err != nil {
+		return fmt.Errorf("store: create job routing %s: %w", rec.ID, err)
+	}
+	return nil
+}
+
+func (s *PostgresStore) GetJobRouting(id string) (*JobRoutingRecord, error) {
+	row := s.db.QueryRow(`SELECT id, runner_http_base_url, created_at FROM jobs WHERE id = $1`, id)
+	rec, err := scanJobRouting(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("store: get job routing %s: %w", id, err)
+	}
+	return rec, nil
+}
+
+func (s *PostgresStore) DeleteJobRouting(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM jobs WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("store: delete job routing %s: %w", id, err)
 	}
 	return nil
 }

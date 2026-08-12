@@ -50,3 +50,11 @@ CREATE INDEX IF NOT EXISTS api_keys_prefix_idx ON api_keys (prefix);
 CREATE INDEX IF NOT EXISTS api_keys_tenant_idx ON api_keys (tenant_id);
 CREATE INDEX IF NOT EXISTS sandboxes_tenant_idx ON sandboxes (tenant_id);
 `
+
+const sqliteJobsSchema = `
+CREATE TABLE IF NOT EXISTS jobs (
+	id                    TEXT    PRIMARY KEY,
+	runner_http_base_url  TEXT    NOT NULL,
+	created_at            INTEGER NOT NULL
+);
+`

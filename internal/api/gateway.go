@@ -52,6 +52,15 @@ func NewGatewayRouter(s store.SandboxStore, cfg *config.APIConfig, reg registry.
 	mux.HandleFunc("POST /sandboxes/{id}/mkdir", sandboxProxy(false))
 	mux.HandleFunc("GET /sandboxes/{id}/stat", sandboxProxy(false))
 
+	jobProxy := jobProxyHandler(s, cfg)
+	mux.HandleFunc("POST /jobs", handleCreateJob(s, reg, cfg))
+	mux.HandleFunc("GET /jobs/{id}", jobProxy)
+	mux.HandleFunc("PUT /jobs/{id}/files", jobProxy)
+	mux.HandleFunc("POST /jobs/{id}/start", jobProxy)
+	mux.HandleFunc("GET /jobs/{id}/events", jobProxy)
+	mux.HandleFunc("GET /jobs/{id}/files/content", jobProxy)
+	mux.HandleFunc("DELETE /jobs/{id}", jobProxy)
+
 	var handler http.Handler = mux
 	if rec.Enabled() {
 		handler = metrics.HTTPMiddleware(rec)(handler)

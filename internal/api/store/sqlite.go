@@ -72,6 +72,11 @@ func NewSQLite(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("store: tenants schema: %w", err)
 	}
 
+	if _, err := db.Exec(sqliteJobsSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: jobs schema: %w", err)
+	}
+
 	slog.Debug("store: opened sqlite database", "path", dbPath)
 	store := &SQLiteStore{db: db}
 	for i := range store.sandboxLocks {
@@ -466,6 +471,33 @@ func (s *SQLiteStore) RevokeAPIKey(id string) error {
 	now := time.Now().Unix()
 	if _, err := s.db.Exec(`UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, now, id); err != nil {
 		return fmt.Errorf("store: revoke api key %s: %w", id, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) CreateJobRouting(rec *JobRoutingRecord) error {
+	const q = `INSERT INTO jobs (id, runner_http_base_url, created_at) VALUES (?, ?, ?)`
+	if _, err := s.db.Exec(q, rec.ID, rec.RunnerHTTPBase, rec.CreatedAt); err != nil {
+		return fmt.Errorf("store: create job routing %s: %w", rec.ID, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) GetJobRouting(id string) (*JobRoutingRecord, error) {
+	row := s.db.QueryRow(`SELECT id, runner_http_base_url, created_at FROM jobs WHERE id = ?`, id)
+	rec, err := scanJobRouting(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("store: get job routing %s: %w", id, err)
+	}
+	return rec, nil
+}
+
+func (s *SQLiteStore) DeleteJobRouting(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM jobs WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("store: delete job routing %s: %w", id, err)
 	}
 	return nil
 }
