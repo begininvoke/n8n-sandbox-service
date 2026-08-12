@@ -28,6 +28,7 @@ const (
 	ResponseTypeExit    ResponseType = "exit"
 	ResponseTypeResult  ResponseType = "result"
 	ResponseTypeError   ResponseType = "error"
+	ResponseTypePulling ResponseType = "pulling"
 )
 
 // Request is the JSON envelope sent from client to daemon.

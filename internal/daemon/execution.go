@@ -71,6 +71,9 @@ func (ex *Execution) append(resp Response) {
 	close(old)
 }
 
+// Append is the exported wrapper so packages outside daemon can push events.
+func (ex *Execution) Append(resp Response) { ex.append(resp) }
+
 // eventsAfter returns pre-marshaled data for retained events with seq > after.
 // If after is nil, all retained events are returned. Caller must hold ex.mu.
 func (ex *Execution) eventsAfter(after *uint64) [][]byte {

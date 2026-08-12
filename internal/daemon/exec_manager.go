@@ -133,6 +133,23 @@ func (em *ExecManager) GetOrCreate(
 	return ex
 }
 
+// NewExternal registers an Execution whose events are produced externally.
+// (GetOrCreate hardcodes HandleExec → /bin/sh -c in-process; jobs must not do that).
+func (em *ExecManager) NewExternal(execID string) *Execution {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if ex, ok := em.executions[execID]; ok {
+		return ex
+	}
+	ex := &Execution{
+		ID:            execID,
+		maxEventBytes: em.maxEventBytes,
+		notify:        make(chan struct{}),
+	}
+	em.executions[execID] = ex
+	return ex
+}
+
 // Get returns the execution with the given exec ID, or nil.
 func (em *ExecManager) Get(execID string) *Execution {
 	em.mu.RLock()
