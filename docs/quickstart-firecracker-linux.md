@@ -8,6 +8,9 @@ Full tarball contract: [BUNDLE.md](../BUNDLE.md).
 ## Requirements
 
 - Ubuntu 22.04 or 24.04, amd64, `/dev/kvm`, root for the runner
+- `crane` or `docker` on PATH — section 1 unpacks the pinned sandbox OCI image
+  with whichever is present. Later sections use Docker to run the API and runner.
+  `install-runner-host.sh` does not install either.
 - Outbound HTTPS (GitHub Releases, Docker Hub, Firecracker CI on S3)
 - Go 1.25+ only if building the runner from source instead of pulling the Docker image
 
@@ -26,9 +29,11 @@ cd firecracker-golden-build
 sudo ./scripts/install-runner-host.sh --download-ci-assets
 
 source /srv/firecracker/ci-assets/manifest.env
+SANDBOX_IMAGE="$(jq -r .sandbox_image.ref MANIFEST.json)"
 sudo env \
   FIRECRACKER_CI_VMLINUX="$FIRECRACKER_CI_VMLINUX" \
-  FIRECRACKER_CI_ROOTFS_SQUASHFS="$FIRECRACKER_CI_ROOTFS_SQUASHFS" \
+  SANDBOX_IMAGE="$SANDBOX_IMAGE" \
+  FIRECRACKER_ROOTFS_SIZE_MB="$(jq -r .firecracker_rootfs_size_mb MANIFEST.json)" \
   TEMPLATE_DIR=/srv/firecracker/template \
   ./scripts/build-rootfs-template.sh
 
@@ -50,7 +55,8 @@ Alternatively, leave mem/state unset and point the runner at the bundle script v
 `SANDBOX_RUNNER_FIRECRACKER_CREATE_SNAPSHOT_SCRIPT` and
 `SANDBOX_RUNNER_FIRECRACKER_DAEMON_BIN`; `Prepare` will create the snapshot once
 and run an admission canary before marking the runner healthy. Production Azure
-VMSS images use this path: first-boot builds the rootfs template only.
+VMSS images bake `rootfs.ext4` at gallery publish time; first-boot only creates
+the host-local mem/state snapshot via Prepare.
 
 ## 2. Runner
 

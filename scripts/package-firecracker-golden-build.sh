@@ -48,6 +48,21 @@ if [[ -z "$OUTPUT" ]]; then
 fi
 
 SERVICE_VERSION="$(tr -d '[:space:]' <"${ROOT}/SERVICE_VERSION")"
+SANDBOX_VERSION="$(tr -d '[:space:]' <"${ROOT}/SANDBOX_VERSION")"
+SANDBOX_IMAGE_REPOSITORY="${SANDBOX_IMAGE_REPOSITORY:-n8nio/n8n-sandbox-service-sandbox}"
+SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_TAG:-${SANDBOX_VERSION}}"
+SANDBOX_IMAGE_REF="${SANDBOX_IMAGE_REF:-${SANDBOX_IMAGE_REPOSITORY}:${SANDBOX_IMAGE_TAG}}"
+# Manifest repository/tag must describe the same image as ref (the pin consumers pull).
+if [[ "$SANDBOX_IMAGE_REF" == *@* ]]; then
+	SANDBOX_IMAGE_REPOSITORY="${SANDBOX_IMAGE_REF%@*}"
+	SANDBOX_IMAGE_TAG=""
+elif [[ "${SANDBOX_IMAGE_REF##*/}" == *:* ]]; then
+	SANDBOX_IMAGE_REPOSITORY="${SANDBOX_IMAGE_REF%:*}"
+	SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_REF##*:}"
+else
+	SANDBOX_IMAGE_REPOSITORY="$SANDBOX_IMAGE_REF"
+	SANDBOX_IMAGE_TAG=""
+fi
 GIT_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 GIT_SHA_SHORT="$(git -C "$ROOT" rev-parse --short HEAD)"
 GIT_REF="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
@@ -57,6 +72,7 @@ fi
 
 FIRECRACKER_VERSION="${FIRECRACKER_VERSION:-v1.14.1}"
 GO_VERSION="${GO_VERSION:-1.25.0}"
+FIRECRACKER_ROOTFS_SIZE_MB="${FIRECRACKER_ROOTFS_SIZE_MB:-2048}"
 PACKAGED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 WORKDIR="$(mktemp -d)"
@@ -66,12 +82,13 @@ BUNDLE="${WORKDIR}/firecracker-golden-build"
 mkdir -p "${BUNDLE}/scripts" "${BUNDLE}/bin"
 
 cp "${ROOT}/scripts/firecracker-golden-build/README.md" "${BUNDLE}/README.md"
-install -m 0755 "${ROOT}/e2e/infra/scripts/create-golden-snapshot.sh" "${BUNDLE}/scripts/"
-install -m 0755 "${ROOT}/e2e/infra/scripts/build-rootfs-template.sh" "${BUNDLE}/scripts/"
-install -m 0755 "${ROOT}/e2e/infra/scripts/configure-host-nat.sh" "${BUNDLE}/scripts/"
-install -m 0755 "${ROOT}/e2e/infra/scripts/install-runner-host.sh" "${BUNDLE}/scripts/"
-install -m 0755 "${ROOT}/e2e/infra/scripts/firecracker-ci-assets.sh" "${BUNDLE}/scripts/"
-install -m 0755 "${ROOT}/e2e/infra/scripts/setup-firecracker-e2e-vm.sh" "${BUNDLE}/scripts/"
+FC_SCRIPTS="${ROOT}/scripts/firecracker.ee"
+install -m 0755 "${FC_SCRIPTS}/create-golden-snapshot.sh" "${BUNDLE}/scripts/"
+install -m 0755 "${FC_SCRIPTS}/build-rootfs-template.sh" "${BUNDLE}/scripts/"
+install -m 0755 "${FC_SCRIPTS}/configure-host-nat.sh" "${BUNDLE}/scripts/"
+install -m 0755 "${FC_SCRIPTS}/install-runner-host.sh" "${BUNDLE}/scripts/"
+install -m 0755 "${FC_SCRIPTS}/firecracker-ci-assets.sh" "${BUNDLE}/scripts/"
+install -m 0755 "${FC_SCRIPTS}/setup-firecracker-e2e-vm.sh" "${BUNDLE}/scripts/"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "${BUNDLE}/bin/sandbox-daemon" "${ROOT}/cmd/daemon"
 chmod 0755 "${BUNDLE}/bin/sandbox-daemon"
@@ -81,6 +98,7 @@ cat >"${BUNDLE}/MANIFEST.json" <<EOF
 {
   "schema_version": 2,
   "service_version": "${SERVICE_VERSION}",
+  "sandbox_version": "${SANDBOX_VERSION}",
   "bundle_version": "${VERSION}",
   "git_sha": "${GIT_SHA}",
   "git_sha_short": "${GIT_SHA_SHORT}",
@@ -88,6 +106,12 @@ cat >"${BUNDLE}/MANIFEST.json" <<EOF
   "packaged_at": "${PACKAGED_AT}",
   "firecracker_version": "${FIRECRACKER_VERSION}",
   "go_version": "${GO_VERSION}",
+  "firecracker_rootfs_size_mb": "${FIRECRACKER_ROOTFS_SIZE_MB}",
+  "sandbox_image": {
+    "repository": "${SANDBOX_IMAGE_REPOSITORY}",
+    "tag": "${SANDBOX_IMAGE_TAG}",
+    "ref": "${SANDBOX_IMAGE_REF}"
+  },
   "entrypoints": {
     "install_runner_host": "scripts/install-runner-host.sh",
     "firecracker_ci_assets": "scripts/firecracker-ci-assets.sh",
