@@ -17,7 +17,9 @@ make shell-lint
 ```
 
 `make shell-fmt` applies the formatting. These need `shfmt` and `shellcheck`
-(`brew install shfmt shellcheck`). Both are enforced in CI.
+(`brew install shfmt shellcheck`). Both are enforced in CI, which pins shfmt
+v3.13.1 and shellcheck v0.11.0 — older shellcheck releases report findings that
+v0.11.0 has since dropped, so match the pinned version locally.
 
 Fix any issues before committing.
 
