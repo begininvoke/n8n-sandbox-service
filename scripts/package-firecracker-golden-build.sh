@@ -47,10 +47,9 @@ if [[ -z "$OUTPUT" ]]; then
 	OUTPUT="${ROOT}/dist/firecracker-golden-build-${VERSION}.tar.gz"
 fi
 
-SERVICE_VERSION="$(tr -d '[:space:]' <"${ROOT}/SERVICE_VERSION")"
-SANDBOX_VERSION="$(tr -d '[:space:]' <"${ROOT}/SANDBOX_VERSION")"
+RELEASE_VERSION="$(tr -d '[:space:]' <"${ROOT}/VERSION")"
 SANDBOX_IMAGE_REPOSITORY="${SANDBOX_IMAGE_REPOSITORY:-n8nio/n8n-sandbox-service-sandbox}"
-SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_TAG:-${SANDBOX_VERSION}}"
+SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_TAG:-${RELEASE_VERSION}}"
 SANDBOX_IMAGE_REF="${SANDBOX_IMAGE_REF:-${SANDBOX_IMAGE_REPOSITORY}:${SANDBOX_IMAGE_TAG}}"
 # Manifest repository/tag must describe the same image as ref (the pin consumers pull).
 if [[ "$SANDBOX_IMAGE_REF" == *@* ]]; then
@@ -63,6 +62,36 @@ else
 	SANDBOX_IMAGE_REPOSITORY="$SANDBOX_IMAGE_REF"
 	SANDBOX_IMAGE_TAG=""
 fi
+
+# An unpublished pin only fails much later, on a runner host, when
+# build-rootfs-template.sh tries to export it. Catch it while packaging. Callers
+# that package from a tree whose VERSION is not published yet (the bundle
+# self-test) set SANDBOX_IMAGE_VERIFY=0.
+verify_sandbox_image_ref() {
+	if [[ "${SANDBOX_IMAGE_VERIFY:-1}" != "1" ]]; then
+		echo "==> Skipping sandbox_image.ref verification (SANDBOX_IMAGE_VERIFY=0)"
+		return 0
+	fi
+	if command -v crane >/dev/null 2>&1; then
+		if ! crane digest "$SANDBOX_IMAGE_REF" >/dev/null 2>&1; then
+			echo "ERROR: sandbox_image.ref does not resolve: ${SANDBOX_IMAGE_REF}" >&2
+			echo "Publish the sandbox release first, or set SANDBOX_IMAGE_REF." >&2
+			exit 1
+		fi
+		return 0
+	fi
+	if docker buildx version >/dev/null 2>&1; then
+		if ! docker buildx imagetools inspect "$SANDBOX_IMAGE_REF" >/dev/null 2>&1; then
+			echo "ERROR: sandbox_image.ref does not resolve: ${SANDBOX_IMAGE_REF}" >&2
+			echo "Publish the sandbox release first, or set SANDBOX_IMAGE_REF." >&2
+			exit 1
+		fi
+		return 0
+	fi
+	echo "WARN: no crane or docker buildx on PATH; not verifying ${SANDBOX_IMAGE_REF}" >&2
+}
+verify_sandbox_image_ref
+
 GIT_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 GIT_SHA_SHORT="$(git -C "$ROOT" rev-parse --short HEAD)"
 GIT_REF="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
@@ -96,9 +125,8 @@ DAEMON_SHA256="$(sha256sum "${BUNDLE}/bin/sandbox-daemon" | awk '{print $1}')"
 
 cat >"${BUNDLE}/MANIFEST.json" <<EOF
 {
-  "schema_version": 2,
-  "service_version": "${SERVICE_VERSION}",
-  "sandbox_version": "${SANDBOX_VERSION}",
+  "schema_version": 3,
+  "version": "${RELEASE_VERSION}",
   "bundle_version": "${VERSION}",
   "git_sha": "${GIT_SHA}",
   "git_sha_short": "${GIT_SHA_SHORT}",

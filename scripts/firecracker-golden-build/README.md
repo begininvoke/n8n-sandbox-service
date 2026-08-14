@@ -4,11 +4,14 @@ This bundle ships the scripts used to build the Firecracker rootfs template and
 golden snapshot on a sandbox runner VM. It is published as a GitHub Release
 asset alongside each service release (`service/v{version}`).
 
-## Contents (schema v2)
+`MANIFEST.json` `version` is the one version shared by the API, runner, and sandbox
+images of that release; deploy the `runner-firecracker` image at that same version.
+
+## Contents (schema v3)
 
 | Path | Purpose |
 |------|---------|
-| `MANIFEST.json` | Service/sandbox versions, sandbox image pin, entrypoints, checksums |
+| `MANIFEST.json` | Release version, sandbox image pin, entrypoints, checksums |
 | `scripts/install-runner-host.sh` | Generic host prerequisites (packages, Firecracker, NAT, dirs) |
 | `scripts/firecracker-ci-assets.sh` | Download/verify Firecracker CI `vmlinux` from S3 |
 | `scripts/build-rootfs-template.sh` | Build `rootfs.ext4` from sandbox OCI image + install `vmlinux` |
@@ -22,7 +25,7 @@ asset alongside each service release (`service/v{version}`).
 1. Download the tarball for the service version you deploy:
 
    ```bash
-   VERSION=1.1.0
+   VERSION=REPLACE_WITH_RELEASE_VERSION
    curl -fsSL -o firecracker-golden-build.tar.gz \
      "https://github.com/n8n-io/n8n-sandbox-service/releases/download/service/v${VERSION}/firecracker-golden-build-${VERSION}.tar.gz"
    tar xzf firecracker-golden-build.tar.gz
@@ -47,7 +50,8 @@ asset alongside each service release (`service/v{version}`).
 
    ```bash
    source /srv/firecracker/ci-assets/manifest.env
-   SANDBOX_IMAGE="$(jq -r .sandbox_image.ref MANIFEST.json)"
+   SANDBOX_IMAGE="$(jq -r '.sandbox_image.ref // empty' MANIFEST.json)"
+   : "${SANDBOX_IMAGE:?bundle has no sandbox_image pin; use a schema v3 or newer release}"
    sudo env \
      FIRECRACKER_CI_VMLINUX="$FIRECRACKER_CI_VMLINUX" \
      SANDBOX_IMAGE="$SANDBOX_IMAGE" \

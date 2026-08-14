@@ -36,7 +36,9 @@ Provide exactly one of --sandbox-image or --sandbox-rootfs-tar (or the matching
 env vars). When --kernel is omitted, downloads the Firecracker CI vmlinux using
 FIRECRACKER_CI_VERSION.
 
-Unpack requires crane or docker on PATH when using --sandbox-image.
+Unpack requires crane or docker on PATH when using --sandbox-image. crane is used
+when present and resolves the ref from a registry, so pass a locally built image
+via --sandbox-rootfs-tar instead of --sandbox-image.
 EOF
 }
 
@@ -87,21 +89,27 @@ ensure_sandbox_user() {
 	if ! maybe_sudo grep -q '^user:' "$rootfs_dir/etc/passwd"; then
 		echo 'user:x:1000:1000:Sandbox User:/home/user:/bin/sh' | maybe_sudo tee -a "$rootfs_dir/etc/passwd" >/dev/null
 	fi
+	# The daemon drops to uid 1000 and must be able to write the workspace.
 	maybe_sudo install -d -m 0755 -o 1000 -g 1000 "$rootfs_dir/home/user"
-	# Caller may chown the staged tree to root for a consistent rootfs; restore the
-	# sandbox home so daemon (drops to uid 1000) can write workspace/skills/etc.
-	maybe_sudo chown -R 1000:1000 "$rootfs_dir/home/user"
 	maybe_sudo install -d -m 1777 -o root -g root "$rootfs_dir/tmp"
+}
+
+# Stages the export tar as root, preserving the numeric ownership and mode bits
+# recorded in the image. Extracting unprivileged and chowning afterwards would
+# work for ownership but clears S_ISUID (chown(2) always kills setuid on files),
+# leaving sudo/su/passwd broken in the guest.
+stage_rootfs_tree() {
+	maybe_sudo install -d -m 0755 -o 0 -g 0 "$1"
 }
 
 unpack_sandbox_image() {
 	local image=$1 dest=$2
 	local cid
 
-	mkdir -p "$dest"
+	stage_rootfs_tree "$dest"
 	if command -v crane >/dev/null 2>&1; then
 		echo "==> Exporting ${image} with crane..."
-		crane export "$image" - | tar -x -C "$dest"
+		crane export "$image" - | maybe_sudo tar -x --numeric-owner -C "$dest"
 		return 0
 	fi
 	if command -v docker >/dev/null 2>&1; then
@@ -111,7 +119,7 @@ unpack_sandbox_image() {
 		fi
 		echo "==> Exporting ${image} with ${docker_bin[*]}..."
 		cid="$("${docker_bin[@]}" create "$image")"
-		if ! "${docker_bin[@]}" export "$cid" | tar -x -C "$dest"; then
+		if ! "${docker_bin[@]}" export "$cid" | maybe_sudo tar -x --numeric-owner -C "$dest"; then
 			"${docker_bin[@]}" rm -f "$cid" >/dev/null 2>&1 || true
 			echo "ERROR: docker export failed for ${image}" >&2
 			exit 1
@@ -125,9 +133,9 @@ unpack_sandbox_image() {
 
 unpack_sandbox_rootfs_tar() {
 	local tar_path=$1 dest=$2
-	mkdir -p "$dest"
+	stage_rootfs_tree "$dest"
 	echo "==> Extracting sandbox rootfs tar ${tar_path}..."
-	tar -x -C "$dest" -f "$tar_path"
+	maybe_sudo tar -x --numeric-owner -C "$dest" -f "$tar_path"
 }
 
 ext4_free_mb() {
@@ -203,7 +211,7 @@ if [[ -z "$FIRECRACKER_CI_VMLINUX" ]]; then
 	fi
 	FIRECRACKER_CI_VERSION="$FIRECRACKER_CI_VERSION" \
 		"$FIRECRACKER_CI_ASSETS_BIN" download "$ci_assets_dir"
-	# shellcheck disable=SC1090
+	# shellcheck source=/dev/null  # written by firecracker-ci-assets.sh at runtime
 	source "${ci_assets_dir}/manifest.env"
 fi
 
@@ -225,9 +233,6 @@ else
 	unpack_sandbox_image "$SANDBOX_IMAGE" "$rootfs_dir"
 fi
 
-# Keep non-home tree as root. ensure_sandbox_user restores /home/user to 1000:1000
-# afterward — the guest daemon drops to uid 1000 and must be able to write workspace.
-maybe_sudo chown -R root:root "$rootfs_dir"
 ensure_sandbox_user "$rootfs_dir"
 seed_resolv_conf "$rootfs_dir"
 

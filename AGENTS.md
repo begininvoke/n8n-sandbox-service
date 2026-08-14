@@ -9,6 +9,16 @@ make fmt-check
 make vet
 ```
 
+After modifying shell scripts, run:
+
+```sh
+make shell-fmt-check
+make shell-lint
+```
+
+`make shell-fmt` applies the formatting. These need `shfmt` and `shellcheck`
+(`brew install shfmt shellcheck`). Both are enforced in CI.
+
 Fix any issues before committing.
 
 ## When making changes to the API

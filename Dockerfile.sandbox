@@ -13,8 +13,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /out/daemon ./cmd/daemon
 # =============================================================================
 # Stage 2: Sandbox image
 # =============================================================================
-# Node >=22 is required by @n8n/workflow-sdk → isolated-vm. Debian bookworm's
-# apt nodejs is still 18, so install the official Node 22 binary instead.
+# Debian bookworm's apt nodejs is 18, which is end-of-life, so install the
+# official Node 22 LTS tarball instead.
 FROM debian:bookworm-slim
 
 ARG TARGETARCH

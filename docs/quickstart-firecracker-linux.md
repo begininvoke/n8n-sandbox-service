@@ -9,18 +9,20 @@ Full tarball contract: [BUNDLE.md](../BUNDLE.md).
 
 - Ubuntu 22.04 or 24.04, amd64, `/dev/kvm`, root for the runner
 - `crane` or `docker` on PATH — section 1 unpacks the pinned sandbox OCI image
-  with whichever is present. Later sections use Docker to run the API and runner.
+  with whichever is present. Later sections use Docker to run the API.
   `install-runner-host.sh` does not install either.
 - Outbound HTTPS (GitHub Releases, Docker Hub, Firecracker CI on S3)
-- Go 1.25+ only if building the runner from source instead of pulling the Docker image
+- Go 1.25+ to build the Firecracker runner
 
 ## 1. Golden-build bundle
 
-Pick a [service release](https://github.com/n8n-io/n8n-sandbox-service/releases) version
-(e.g. `1.1.0`). Download its tarball and build the host-local snapshot:
+Pick a [service release](https://github.com/n8n-io/n8n-sandbox-service/releases)
+whose golden-build bundle is `schema_version` 3 or newer — schema v2 bundles built
+the guest from an Ubuntu squashfs and carry no `sandbox_image` pin. Download its
+tarball and build the host-local snapshot:
 
 ```bash
-VERSION=1.1.0
+VERSION=REPLACE_WITH_RELEASE_VERSION
 curl -fsSL -o firecracker-golden-build.tar.gz \
   "https://github.com/n8n-io/n8n-sandbox-service/releases/download/service/v${VERSION}/firecracker-golden-build-${VERSION}.tar.gz"
 tar xzf firecracker-golden-build.tar.gz
@@ -29,7 +31,8 @@ cd firecracker-golden-build
 sudo ./scripts/install-runner-host.sh --download-ci-assets
 
 source /srv/firecracker/ci-assets/manifest.env
-SANDBOX_IMAGE="$(jq -r .sandbox_image.ref MANIFEST.json)"
+SANDBOX_IMAGE="$(jq -r '.sandbox_image.ref // empty' MANIFEST.json)"
+: "${SANDBOX_IMAGE:?bundle has no sandbox_image pin; use a schema v3 or newer release}"
 sudo env \
   FIRECRACKER_CI_VMLINUX="$FIRECRACKER_CI_VMLINUX" \
   SANDBOX_IMAGE="$SANDBOX_IMAGE" \
@@ -60,19 +63,7 @@ the host-local mem/state snapshot via Prepare.
 
 ## 2. Runner
 
-### Option A: Docker Hub image (recommended)
-
-```bash
-docker pull "n8nio/n8n-sandbox-service-runner-firecracker:${VERSION}"
-```
-
-The image is linux/amd64 only and ships `sandbox-runner` plus Firecracker/jailer
-binaries. Run on the host with `/dev/kvm`, snapshot paths mounted, and the same env
-vars as section 4 (use the image entrypoint instead of `/usr/local/bin/sandbox-runner`).
-
-### Option B: Build from source
-
-Build at the same commit as the bundle:
+Build the runner at the same commit as the bundle and install it on the host:
 
 ```bash
 git clone https://github.com/n8n-io/n8n-sandbox-service.git
@@ -81,6 +72,10 @@ git checkout "$GIT_SHA"
 make runner-firecracker
 sudo install -m 0755 bin/runner-firecracker /usr/local/bin/sandbox-runner
 ```
+
+The published `runner-firecracker` container image is intended for managed
+deployment tooling that supplies its required KVM, host networking, cgroup,
+jailer, template, and snapshot mounts. This host quickstart does not use it.
 
 ## 3. API + mTLS (same host)
 

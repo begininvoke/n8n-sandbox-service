@@ -71,9 +71,21 @@ if ! grep -Eq 'User:[[:space:]]*1000[[:space:]]+Group:[[:space:]]*1000' <<<"$wor
 	exit 1
 fi
 
+# chown(2) clears S_ISUID, so staging the rootfs unprivileged and chowning it
+# afterwards silently breaks sudo in the guest while Docker sandboxes keep it.
+sudo_stat="$(debugfs -R 'stat /usr/bin/sudo' "${template_dir}/rootfs.ext4" 2>/dev/null || true)"
+if ! grep -Eq 'Mode:[[:space:]]*0?4755' <<<"$sudo_stat"; then
+	echo "ERROR: /usr/bin/sudo must keep mode 4755 in rootfs.ext4" >&2
+	printf '%s\n' "$sudo_stat" >&2
+	exit 1
+fi
+
 echo "==> Packaging golden-build bundle..."
 bundle_tar="${work}/bundle.tar.gz"
+# The tree's VERSION is only published once its release runs, so assert manifest
+# shape here and leave registry verification to the release workflows.
 FIRECRACKER_ROOTFS_SIZE_MB="$FIRECRACKER_ROOTFS_SIZE_MB" \
+	SANDBOX_IMAGE_VERIFY=0 \
 	bash "${ROOT}/scripts/package-firecracker-golden-build.sh" \
 	--version "ci-self-test" \
 	--output "$bundle_tar"
@@ -83,8 +95,13 @@ mkdir -p "$(dirname "$bundle_dir")"
 tar -C "${work}/unpacked" -xzf "$bundle_tar"
 
 manifest="${bundle_dir}/MANIFEST.json"
-if [[ "$(jq -r .schema_version "$manifest")" != "2" ]]; then
-	echo "ERROR: expected MANIFEST.json schema_version 2" >&2
+if [[ "$(jq -r .schema_version "$manifest")" != "3" ]]; then
+	echo "ERROR: expected MANIFEST.json schema_version 3" >&2
+	exit 1
+fi
+release_version="$(tr -d '[:space:]' <"${ROOT}/VERSION")"
+if [[ "$(jq -r .version "$manifest")" != "$release_version" ]]; then
+	echo "ERROR: MANIFEST.json version does not match VERSION (${release_version})" >&2
 	exit 1
 fi
 sandbox_ref="$(jq -r .sandbox_image.ref "$manifest")"
@@ -95,6 +112,12 @@ if [[ "$sandbox_ref" == "null" || -z "$sandbox_ref" ]]; then
 	exit 1
 fi
 if [[ -n "$sandbox_tag" ]]; then
+	# Default pin: one version ties the images together, so the sandbox tag is the
+	# release version. Callers that pin another registry or a digest override the ref.
+	if [[ "$sandbox_tag" != "$release_version" ]]; then
+		echo "ERROR: sandbox_image.tag (${sandbox_tag}) must equal the release version (${release_version})" >&2
+		exit 1
+	fi
 	if [[ "$sandbox_ref" != "${sandbox_repo}:${sandbox_tag}" ]]; then
 		echo "ERROR: sandbox_image.ref does not match repository:tag (${sandbox_repo}:${sandbox_tag} vs ${sandbox_ref})" >&2
 		exit 1

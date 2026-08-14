@@ -22,6 +22,16 @@ jobs:
       - name: Vet
         run: make vet
 
+      # shellcheck is preinstalled on the runner image; shfmt is not.
+      - name: Install shfmt
+        run: go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
+
+      - name: Check shell formatting
+        run: make shell-fmt-check
+
+      - name: Lint shell scripts
+        run: make shell-lint
+
       - name: Build
         run: make all
 
