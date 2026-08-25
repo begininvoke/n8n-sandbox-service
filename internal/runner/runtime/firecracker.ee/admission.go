@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+	"github.com/n8n-io/sandbox-service/internal/shellquote"
 )
 
 const (
@@ -129,6 +131,21 @@ func (r *Runtime) pinSnapshotAssets() error {
 			return fmt.Errorf("firecracker %s path does not exist: %s", label, path)
 		}
 	}
+
+	params, err := loadBootParams(bootParamsPath(r.config))
+	if err != nil {
+		return err
+	}
+	if err := params.matchesConfig(r.config); err != nil {
+		return err
+	}
+	slog.Info("firecracker golden snapshot boot parameters",
+		"vcpu_count", params.VCPUCount,
+		"mem_size_mib", params.MemSizeMiB,
+		"kernel_image_path", params.KernelImagePath,
+		"boot_args", params.BootArgs,
+		"guest_ip", params.GuestIP,
+	)
 	return nil
 }
 
@@ -181,15 +198,20 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ensureGoldenSnapshot creates host-local mem/state when missing, using the
-// bundled create-golden-snapshot.sh when configured.
+// ensureGoldenSnapshot creates host-local mem/state/boot.json when any is
+// missing, using the bundled create-golden-snapshot.sh when configured. The
+// boot parameter sidecar counts as part of the snapshot: a runner upgraded onto
+// a host whose snapshot predates it has mem and state but no boot.json, and the
+// three have to describe the same build, so the whole set is rewritten rather
+// than the sidecar reconstructed from current config.
 func (r *Runtime) ensureGoldenSnapshot(ctx context.Context) error {
-	if r.deps.pathExists(r.config.SnapshotMemPath) && r.deps.pathExists(r.config.SnapshotStatePath) {
+	bootPath := bootParamsPath(r.config)
+	if r.deps.pathExists(r.config.SnapshotMemPath) && r.deps.pathExists(r.config.SnapshotStatePath) && r.deps.pathExists(bootPath) {
 		return nil
 	}
 	if strings.TrimSpace(r.config.CreateSnapshotScript) == "" {
-		return fmt.Errorf("golden snapshot missing at %s / %s and create script is not configured",
-			r.config.SnapshotMemPath, r.config.SnapshotStatePath)
+		return fmt.Errorf("golden snapshot incomplete (need %s, %s and %s) and create script is not configured; re-run create-golden-snapshot.sh with --out %s",
+			r.config.SnapshotMemPath, r.config.SnapshotStatePath, bootPath, filepath.Dir(r.config.SnapshotMemPath))
 	}
 	if !r.deps.pathExists(r.config.CreateSnapshotScript) {
 		return fmt.Errorf("create snapshot script does not exist: %s", r.config.CreateSnapshotScript)
@@ -210,21 +232,80 @@ func (r *Runtime) ensureGoldenSnapshot(ctx context.Context) error {
 		"out", outDir,
 		"kernel", kernel,
 		"ext4", ext4,
+		"boot_params_missing", !r.deps.pathExists(bootPath),
 	)
-	if err := r.deps.run(ctx, "sudo", r.config.CreateSnapshotScript,
-		"--kernel", kernel,
-		"--ext4", ext4,
-		"--daemon-bin", r.config.DaemonBin,
-		"--out", outDir,
-	); err != nil {
+	if err := r.deps.run(ctx, "sudo", "/bin/sh", "-c", createSnapshotCommand(r.config, outDir, kernel, ext4)); err != nil {
 		return fmt.Errorf("create golden snapshot: %w", err)
 	}
 	if err := ensureSnapshotSymlinks(outDir, r.config.SnapshotMemPath, r.config.SnapshotStatePath, r.deps.pathExists); err != nil {
 		return err
 	}
-	if !r.deps.pathExists(r.config.SnapshotMemPath) || !r.deps.pathExists(r.config.SnapshotStatePath) {
-		return fmt.Errorf("golden snapshot still missing after create at %s / %s",
-			r.config.SnapshotMemPath, r.config.SnapshotStatePath)
+	if !r.deps.pathExists(r.config.SnapshotMemPath) || !r.deps.pathExists(r.config.SnapshotStatePath) || !r.deps.pathExists(bootPath) {
+		return fmt.Errorf("golden snapshot still missing after create at %s / %s / %s",
+			r.config.SnapshotMemPath, r.config.SnapshotStatePath, bootPath)
+	}
+	return verifySnapshotPathsResolveToOutputs(outDir, r.config.SnapshotMemPath, r.config.SnapshotStatePath)
+}
+
+// createSnapshotCommand builds the privileged command that runs
+// create-golden-snapshot.sh with the four settings the runner and the snapshot
+// have to agree on. The script takes them as environment variables, defaulting
+// to the same values as the runner, so without them a runner configured off
+// those defaults auto-creates a snapshot built for the defaults instead, and
+// matchesConfig then rejects it on every admission attempt: the runner stays
+// unhealthy for as long as it auto-creates its own snapshot.
+//
+// The assignments go inside the privileged shell rather than on the runner's own
+// exec: sudo resets the environment, and letting it through would need a
+// SETENV-tagged sudoers rule this deployment does not have. Memory and vCPU
+// count stay script-owned; the runner has no configuration for either.
+func createSnapshotCommand(cfg Config, outDir, kernel, ext4 string) string {
+	return fmt.Sprintf(`set -eu
+GUEST_IP=%s \
+HOST_TAP_IP_CIDR=%s \
+HOST_TAP_DEVICE_NAME=%s \
+DAEMON_PORT=%s \
+%s --kernel %s --ext4 %s --daemon-bin %s --out %s
+`,
+		shellquote.Quote(cfg.GuestIP),
+		shellquote.Quote(cfg.HostTapIPCIDR),
+		shellquote.Quote(cfg.HostTapDeviceName),
+		shellquote.Quote(strconv.Itoa(cfg.DaemonPort)),
+		shellquote.Quote(cfg.CreateSnapshotScript),
+		shellquote.Quote(kernel),
+		shellquote.Quote(ext4),
+		shellquote.Quote(cfg.DaemonBin),
+		shellquote.Quote(outDir),
+	)
+}
+
+// verifySnapshotPathsResolveToOutputs rejects configured mem/state paths that do
+// not resolve to the files the create script just wrote. Regeneration only
+// replaces snapshot_mem and snapshot_state inside outDir, so a configured path
+// that is an independent copy, a hard link, or a symlink out of outDir survives
+// untouched and still holds the previous snapshot while the fresh boot.json
+// describes the new one. That combination is the one thing the sidecar exists to
+// rule out: matchesConfig would certify a snapshot the runner never restores,
+// and every sandbox would come up against whatever the old build was configured
+// for. Reported rather than repaired, because replacing snapshot assets the
+// runner did not create is a worse surprise than one clear startup error.
+func verifySnapshotPathsResolveToOutputs(outDir, memPath, statePath string) error {
+	for _, asset := range []struct{ label, configured, generated string }{
+		{"memory", memPath, filepath.Join(outDir, "snapshot_mem")},
+		{"state", statePath, filepath.Join(outDir, "snapshot_state")},
+	} {
+		configured, err := filepath.EvalSymlinks(asset.configured)
+		if err != nil {
+			return fmt.Errorf("resolve snapshot %s path %s: %w", asset.label, asset.configured, err)
+		}
+		generated, err := filepath.EvalSymlinks(asset.generated)
+		if err != nil {
+			return fmt.Errorf("resolve generated snapshot %s %s: %w", asset.label, asset.generated, err)
+		}
+		if configured != generated {
+			return fmt.Errorf("snapshot %s path %s resolves to %s, but create-golden-snapshot.sh wrote %s; the runner would restore a snapshot that the regenerated %s does not describe, so point the configured path at the generated file or remove it and let the runner symlink it",
+				asset.label, asset.configured, configured, generated, bootParamsFileName)
+		}
 	}
 	return nil
 }

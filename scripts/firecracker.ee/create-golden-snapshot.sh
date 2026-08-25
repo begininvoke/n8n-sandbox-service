@@ -18,6 +18,10 @@ HOST_TAP_IP="${HOST_TAP_IP_CIDR%%/*}"
 HOST_TAP_DEVICE_NAME="${HOST_TAP_DEVICE_NAME:-fc-tap-0}"
 DAEMON_PORT="${DAEMON_PORT:-8081}"
 GUEST_MAC="${GUEST_MAC:-AA:FC:00:00:00:01}"
+# Paths as Firecracker sees them inside the jail. Recorded in boot.json so a
+# later cold boot can reproduce this VM without guessing.
+KERNEL_JAIL_PATH="/vmlinux"
+ROOTFS_JAIL_PATH="/rootfs.ext4"
 VM_ID="snapshot-$RANDOM-$$"
 NETNS="fc-snapshot-$$"
 JAIL_ROOT=""
@@ -72,6 +76,8 @@ DAEMON_BIN="$(realpath "$DAEMON_BIN")"
 OUT_DIR="$(realpath "$OUT_DIR")"
 SNAPSHOT_MEM="${OUT_DIR}/snapshot_mem"
 SNAPSHOT_STATE="${OUT_DIR}/snapshot_state"
+BOOT_PARAMS="${OUT_DIR}/boot.json"
+BOOT_PARAMS_TMP="${BOOT_PARAMS}.tmp"
 
 # Sends a PUT request to the Firecracker API socket in the jail. Firecracker uses
 # REST over a Unix socket for machine configuration and lifecycle actions.
@@ -116,6 +122,7 @@ cleanup() {
 	fi
 	ip netns delete "$NETNS" >/dev/null 2>&1
 	rm -rf "${JAILER_BASE_DIR}/firecracker/${VM_ID}" >/dev/null 2>&1
+	rm -f "$BOOT_PARAMS_TMP" >/dev/null 2>&1
 	exit "$exit_code"
 }
 trap cleanup EXIT
@@ -161,7 +168,7 @@ if [[ ! -S "${JAIL_ROOT}/firecracker.socket" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
-rm -f "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
+rm -f "$SNAPSHOT_MEM" "$SNAPSHOT_STATE" "$BOOT_PARAMS" "$BOOT_PARAMS_TMP"
 touch "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
 # Jailer runs Firecracker as uid/gid 1000; virtio block needs RW on rootfs.
 chown 1000:1000 "$KERNEL" "$ROOTFS" "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
@@ -175,8 +182,8 @@ boot_args="console=ttyS0 reboot=k panic=1 pci=off ipv6.disable=1 init=/sandbox-d
 
 echo "==> Configuring and booting Firecracker snapshot VM..."
 api_put "/machine-config" "{\"vcpu_count\":${VCPUS},\"mem_size_mib\":${MEM_MIB},\"smt\":false}"
-api_put "/boot-source" "{\"kernel_image_path\":\"/vmlinux\",\"boot_args\":\"${boot_args}\"}"
-api_put "/drives/rootfs" "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/rootfs.ext4\",\"is_root_device\":true,\"is_read_only\":false}"
+api_put "/boot-source" "{\"kernel_image_path\":\"${KERNEL_JAIL_PATH}\",\"boot_args\":\"${boot_args}\"}"
+api_put "/drives/rootfs" "{\"drive_id\":\"rootfs\",\"path_on_host\":\"${ROOTFS_JAIL_PATH}\",\"is_root_device\":true,\"is_read_only\":false}"
 api_put "/network-interfaces/eth0" "{\"iface_id\":\"eth0\",\"guest_mac\":\"${GUEST_MAC}\",\"host_dev_name\":\"${HOST_TAP_DEVICE_NAME}\"}"
 api_put "/actions" '{"action_type":"InstanceStart"}'
 
@@ -197,4 +204,38 @@ api_patch "/vm" '{"state":"Paused"}'
 api_put "/snapshot/create" '{"snapshot_type":"Full","snapshot_path":"/snapshot_state","mem_file_path":"/snapshot_mem"}'
 
 chmod 0644 "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
+
+# Written last, so a sidecar is never left claiming a snapshot that failed to
+# build. The runner replays these values verbatim when it has to cold boot a
+# sandbox whose VM died: memory, vCPUs and the kernel command line are chosen
+# here and exist nowhere in the runner's own configuration.
+#
+# Staged in a temporary file and renamed into place: the runner treats the
+# presence of boot.json as proof the snapshot set is complete and skips
+# rebuilding, so a half-written sidecar left behind by an interrupted run would
+# fail admission on every subsequent startup.
+echo "==> Recording boot parameters at ${BOOT_PARAMS}..."
+cat >"$BOOT_PARAMS_TMP" <<EOF
+{
+  "schema_version": 1,
+  "vcpu_count": ${VCPUS},
+  "mem_size_mib": ${MEM_MIB},
+  "kernel_image_path": "${KERNEL_JAIL_PATH}",
+  "boot_args": "${boot_args}",
+  "rootfs_drive_path": "${ROOTFS_JAIL_PATH}",
+  "guest_mac": "${GUEST_MAC}",
+  "guest_ip": "${GUEST_IP}",
+  "host_tap_device_name": "${HOST_TAP_DEVICE_NAME}",
+  "daemon_port": ${DAEMON_PORT},
+  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+chmod 0644 "$BOOT_PARAMS_TMP"
+# The snapshot files and the staged sidecar have to reach disk before the rename
+# publishes them, and the rename itself has to reach disk after it: a rename left
+# in the page cache is lost by an unclean host shutdown, which would leave mem
+# and state without the boot.json the runner needs to cold boot.
+sync
+mv "$BOOT_PARAMS_TMP" "$BOOT_PARAMS"
+sync
 echo "==> Firecracker snapshot created at ${OUT_DIR}"
