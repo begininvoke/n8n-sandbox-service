@@ -21,12 +21,14 @@ const (
 // crash handling reads: a container that died and came back looks running again, on
 // an address it did not have before.
 type crashBackend struct {
-	mu       sync.Mutex
-	states   []containerState // consumed in order; the last one repeats
-	ip       string
-	stops    int
-	watch    func(ctx context.Context, onDie func(containerID, sandboxID string)) error
-	inspects int
+	mu        sync.Mutex
+	states    []containerState // consumed in order; the last one repeats
+	ip        string
+	stops     int
+	stopErr   error
+	removeErr error
+	watch     func(ctx context.Context, onDie func(containerID, sandboxID string)) error
+	inspects  int
 }
 
 func runningState() containerState {
@@ -62,7 +64,7 @@ func (f *crashBackend) stopContainer(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stops++
-	return nil
+	return f.stopErr
 }
 
 func (f *crashBackend) watchContainerDeaths(ctx context.Context, onDie func(string, string)) error {
@@ -75,16 +77,15 @@ func (f *crashBackend) watchContainerDeaths(ctx context.Context, onDie func(stri
 func (f *crashBackend) startContainer(context.Context, string) error { return nil }
 func (f *crashBackend) ping(context.Context) error                   { return nil }
 func (f *crashBackend) removeContainer(context.Context, string) error {
-	return nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.removeErr
 }
 func (f *crashBackend) createContainer(context.Context, string, string, string, *ResourceLimits, bool) (string, error) {
 	return "", errors.New("unexpected createContainer")
 }
 func (f *crashBackend) inspectNetwork(context.Context, string) (*networkInspect, error) {
 	return nil, errors.New("unexpected inspectNetwork")
-}
-func (f *crashBackend) listContainersByLabel(context.Context, string, string) ([]string, error) {
-	return nil, errors.New("unexpected listContainersByLabel")
 }
 func (f *crashBackend) pullImage(context.Context, string) error { return nil }
 func (f *crashBackend) run(context.Context, ...string) (string, error) {
@@ -250,9 +251,9 @@ func TestAStopThatNeverDiedDoesNotMaskALaterCrash(t *testing.T) {
 	backend := &crashBackend{states: []containerState{runningState()}, ip: "172.18.0.2"}
 	m, _ := newCrashRuntime(t, backend)
 
-	// A stop whose death never arrives — the stop failed, or the container was already
-	// exited when it was removed — leaves a mark behind, and Docker reuses nothing but
-	// the runner would keep it forever. Aged past its TTL it stops excusing deaths.
+	// A stop whose death never arrives — a container that was already exited when it
+	// was removed — leaves a mark behind, and Docker reuses nothing but the runner
+	// would keep it forever. Aged past its TTL it stops excusing deaths.
 	m.expectStop(crashContainerID)
 	m.mu.Lock()
 	m.expectedStops[crashContainerID] = time.Now().Add(-2 * expectedStopTTL)
@@ -267,6 +268,134 @@ func TestAStopThatNeverDiedDoesNotMaskALaterCrash(t *testing.T) {
 	m.mu.Unlock()
 	if kept {
 		t.Error("the expired stop was kept, so the map grows for every stop that never died")
+	}
+}
+
+// The other half of that: a stop the runner asked for and did not get leaves the
+// container running, so its mark has to go immediately rather than waiting out the
+// TTL. Kept for even a moment past the failure it excuses the next real crash of the
+// same container — served with no 409, and with network rules still naming the
+// address the container had before Docker restarted it.
+func TestAStopThatFailedDoesNotExcuseALaterCrash(t *testing.T) {
+	failed := errors.New("docker stop timed out")
+	tests := map[string]func(*crashBackend, *Runtime){
+		"stop": func(b *crashBackend, m *Runtime) {
+			b.stopErr = failed
+			if err := m.StopSandboxContainer(context.Background(), crashSandboxID); err == nil {
+				t.Fatal("expected the stop to fail")
+			}
+		},
+		"delete": func(b *crashBackend, m *Runtime) {
+			b.removeErr = failed
+			if err := m.DeleteSandbox(context.Background(), crashSandboxID); err == nil {
+				t.Fatal("expected the delete to fail")
+			}
+		},
+		"wake failure cleanup": func(b *crashBackend, m *Runtime) {
+			b.stopErr = failed
+			m.cleanupWakeFailure(crashContainerID)
+		},
+	}
+	for name, failStop := range tests {
+		t.Run(name, func(t *testing.T) {
+			backend := &crashBackend{states: []containerState{runningState()}, ip: "172.18.0.2"}
+			m, policyIPs := newCrashRuntime(t, backend)
+			rec := metrics.NewRunnerRecorder(true)
+			m.SetMetricsRecorder(rec)
+
+			failStop(backend, m)
+
+			// The container survived the failed stop and then died on its own, well
+			// inside expectedStopTTL. Docker restarts it on a new address.
+			m.handleContainerDeath(crashContainerID, crashSandboxID)
+			backend.ip = "172.18.0.9"
+
+			if !m.wasRestarted(crashSandboxID) {
+				t.Fatal("a stop that never happened swallowed a real crash")
+			}
+			if got := rec.GuestDeathCount(); got != 1 {
+				t.Errorf("guest death metric = %v, want 1", got)
+			}
+			if _, err := m.DaemonURL(context.Background(), crashSandboxID); !errors.Is(err, ErrSandboxNotRunning) {
+				t.Errorf("DaemonURL() error = %v, want %v; the crashed sandbox must not be proxied to", err, ErrSandboxNotRunning)
+			}
+
+			backend.stopErr, backend.removeErr = nil, nil
+			wake, err := m.EnsureSandboxRunning(context.Background(), crashSandboxID)
+			if err != nil {
+				t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+			}
+			if !wake.Recovered {
+				t.Error("the wake did not report the restart, so the request that drove it would be proxied to a sandbox that lost its state")
+			}
+			if want := []string{"172.18.0.9"}; len(*policyIPs) != 1 || (*policyIPs)[0] != want[0] {
+				t.Errorf("network policy applied for %v, want %v: the rules have to follow the container's new address", *policyIPs, want)
+			}
+		})
+	}
+}
+
+// Stopping a container Docker is between restarts of is the one stop that gets no
+// death of its own: the crash already emitted it, and the stop only cancels the
+// restart. Docker reports such a container as running, so the stop records a mark
+// like any other and nothing ever claims it. Left in place it is spent on the next
+// death of the same container, which is the crash after the wake below — served with
+// no 409, and with network rules still naming the address the container had.
+func TestAStopDuringDockersRestartDoesNotExcuseALaterCrash(t *testing.T) {
+	backend := &crashBackend{
+		states: []containerState{
+			// The stop and the wake both inspect: restarting first, then exited once
+			// the stop has cancelled the restart.
+			{Status: containerStatusRestarting, Running: true, Restarting: true},
+			{Status: containerStatusExited},
+		},
+		ip: "172.18.0.2",
+	}
+	m, policyIPs := newCrashRuntime(t, backend)
+	rec := metrics.NewRunnerRecorder(true)
+	m.SetMetricsRecorder(rec)
+
+	// The crash that put it into the restart loop, reported as one.
+	m.handleContainerDeath(crashContainerID, crashSandboxID)
+	if got := rec.GuestDeathCount(); got != 1 {
+		t.Fatalf("guest death metric = %v, want 1", got)
+	}
+
+	// Idle long enough to be swept up while Docker was still restarting it.
+	if err := m.StopSandboxContainer(context.Background(), crashSandboxID); err != nil {
+		t.Fatalf("StopSandboxContainer() failed: %v", err)
+	}
+	if backend.stops != 1 {
+		t.Errorf("docker stop called %d times, want 1: a restarting container is reported running, so the stop is not a no-op", backend.stops)
+	}
+
+	// The client comes back and the sandbox is started again.
+	if _, err := m.EnsureSandboxRunning(context.Background(), crashSandboxID); err != nil {
+		t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+	}
+	backend.ip = "172.18.0.9"
+
+	// It crashes again, still inside expectedStopTTL of that stop.
+	m.handleContainerDeath(crashContainerID, crashSandboxID)
+
+	if !m.wasRestarted(crashSandboxID) {
+		t.Fatal("a stop that never had a death of its own swallowed a real crash")
+	}
+	if got := rec.GuestDeathCount(); got != 2 {
+		t.Errorf("guest death metric = %v, want 2", got)
+	}
+	if _, err := m.DaemonURL(context.Background(), crashSandboxID); !errors.Is(err, ErrSandboxNotRunning) {
+		t.Errorf("DaemonURL() error = %v, want %v; the crashed sandbox must not be proxied to", err, ErrSandboxNotRunning)
+	}
+	wake, err := m.EnsureSandboxRunning(context.Background(), crashSandboxID)
+	if err != nil {
+		t.Fatalf("second EnsureSandboxRunning() failed: %v", err)
+	}
+	if !wake.Recovered {
+		t.Error("the wake did not report the second crash, so the request that drove it would be proxied to a sandbox that lost its state")
+	}
+	if want := "172.18.0.9"; len(*policyIPs) == 0 || (*policyIPs)[len(*policyIPs)-1] != want {
+		t.Errorf("network policy applied for %v, want %v last: the rules have to follow the container's new address", *policyIPs, want)
 	}
 }
 

@@ -385,6 +385,15 @@ func (m *Runtime) ensureSandboxRunningOnce(ctx context.Context, sandboxID string
 		if !canStartContainer(inspect.State) {
 			return recovering, fmt.Errorf("sandbox container is not startable from docker state %q", inspect.State.Status)
 		}
+		// A mark still recorded here belongs to a process that is already gone, so it
+		// can only ever excuse the wrong death: the stop it was recorded for either
+		// produced its event long ago or was never going to produce one. Stopping a
+		// container Docker is between restarts of is the case that reaches this — the
+		// crash already emitted the only death there was, and the stop just cancels the
+		// restart — and the container it leaves behind is the one this line is about to
+		// start. Dropped before the start, not after, because the new process can die
+		// first.
+		m.forgetExpectedStop(containerID)
 		if err := m.docker.startContainer(ctx, containerID); err != nil {
 			return recovering, fmt.Errorf("start container: %w", err)
 		}
@@ -448,6 +457,7 @@ func (m *Runtime) cleanupWakeFailure(containerID string) {
 	defer cancel()
 	m.expectStop(containerID)
 	if err := m.docker.stopContainer(cleanupCtx, containerID); err != nil {
+		m.forgetExpectedStop(containerID)
 		slog.Warn("stop container after wake failure", "container_id", containerID, "err", err)
 		return
 	}
@@ -475,7 +485,11 @@ func (m *Runtime) StopSandboxContainer(ctx context.Context, sandboxID string) er
 		return nil
 	}
 	m.expectStop(containerID)
-	return m.docker.stopContainer(ctx, containerID)
+	if err := m.docker.stopContainer(ctx, containerID); err != nil {
+		m.forgetExpectedStop(containerID)
+		return err
+	}
+	return nil
 }
 
 // DaemonURL returns the daemon URL for a container by sandbox ID.
@@ -535,6 +549,7 @@ func (m *Runtime) removeContainerAndTeardownRules(ctx context.Context, container
 	// Removing a running container kills it, and that death is the runner's doing.
 	m.expectStop(containerID)
 	if err := m.docker.removeContainer(ctx, containerID); err != nil {
+		m.forgetExpectedStop(containerID)
 		slog.Warn("remove sandbox container", "container_id", containerID, "err", err)
 		return err
 	}
@@ -647,7 +662,7 @@ func isSuccessfulExit(body []byte) bool {
 }
 
 func (m *Runtime) reconcileContainers(ctx context.Context) error {
-	ids, err := m.docker.listContainersByLabel(ctx, containerLabelManaged, containerLabelManagedVal)
+	ids, err := m.docker.findContainerByLabels(ctx, managedLabelFilter)
 	if err != nil {
 		return err
 	}
@@ -683,7 +698,7 @@ func (m *Runtime) createRunnerBridge(ctx context.Context) (*networkInspect, erro
 
 // ManagedContainerCount returns how many sandbox containers this runner is managing.
 func (m *Runtime) ManagedContainerCount(ctx context.Context) (int, error) {
-	ids, err := m.docker.listContainersByLabel(ctx, containerLabelManaged, containerLabelManagedVal)
+	ids, err := m.docker.findContainerByLabels(ctx, managedLabelFilter)
 	if err != nil {
 		return 0, err
 	}
@@ -693,7 +708,7 @@ func (m *Runtime) ManagedContainerCount(ctx context.Context) (int, error) {
 // FindContainerIDByLabel finds a container ID by sandbox ID using label filters.
 func (m *Runtime) FindContainerIDByLabel(ctx context.Context, sandboxID string) (string, error) {
 	lines, err := m.docker.findContainerByLabels(ctx,
-		"label="+containerLabelManaged+"="+containerLabelManagedVal,
+		managedLabelFilter,
 		"label="+containerLabelSandboxID+"="+sandboxID)
 	if err != nil {
 		return "", err

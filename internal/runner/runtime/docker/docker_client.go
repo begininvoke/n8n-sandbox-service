@@ -20,6 +20,10 @@ const (
 	containerLabelManaged    = "sandbox-service.managed"
 	containerLabelManagedVal = "true"
 	containerLabelSandboxID  = "sandbox-service.id"
+
+	// managedLabelFilter selects the containers this runner owns, and is what keeps
+	// every lookup and the death watcher agreeing on that set.
+	managedLabelFilter = "label=" + containerLabelManaged + "=" + containerLabelManagedVal
 )
 
 type containerInspect struct {
@@ -75,7 +79,6 @@ type dockerBackend interface {
 	containerIP(ctx context.Context, containerID string) (string, error)
 	inspectContainer(ctx context.Context, containerID string) (*containerInspect, error)
 	inspectNetwork(ctx context.Context, name string) (*networkInspect, error)
-	listContainersByLabel(ctx context.Context, label, value string) ([]string, error)
 	findContainerByLabels(ctx context.Context, filterArgs ...string) ([]string, error)
 	pullImage(ctx context.Context, image string) error
 	watchContainerDeaths(ctx context.Context, onDie func(containerID, sandboxID string)) error
@@ -237,8 +240,8 @@ func (dc *dockerClient) inspectNetwork(ctx context.Context, name string) (*netwo
 	return &items[0], nil
 }
 
-func (dc *dockerClient) listContainersByLabel(ctx context.Context, label, value string) ([]string, error) {
-	out, err := dc.run(ctx, "ps", "-aq", "--filter", "label="+label+"="+value)
+func (dc *dockerClient) findContainerByLabels(ctx context.Context, filterArgs ...string) ([]string, error) {
+	out, err := dc.run(ctx, containerIDArgs(filterArgs...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -249,20 +252,23 @@ func (dc *dockerClient) listContainersByLabel(ctx context.Context, label, value 
 	return lines, nil
 }
 
-func (dc *dockerClient) findContainerByLabels(ctx context.Context, filterArgs ...string) ([]string, error) {
-	args := []string{"ps", "-aq"}
-	for _, f := range filterArgs {
+// containerIDArgs builds the lookup every container ID in this package comes from,
+// so there is one place that decides how wide those IDs are.
+//
+// --no-trunc is the whole reason it exists. docker ps abbreviates IDs to 12
+// characters, while docker create and the die events from docker events both report
+// the full 64, and the runner matches one against the other: a stop it recorded
+// under an abbreviated ID never matches the death that stop caused, so the runner
+// reads its own deliberate stop as a crash and the next request is refused with
+// 409 sandbox_restarted. Nothing downstream notices the difference otherwise —
+// docker resolves ID prefixes, and netrules truncates to 12 for its chain names.
+func containerIDArgs(filters ...string) []string {
+	args := make([]string, 0, 3+2*len(filters))
+	args = append(args, "ps", "-aq", "--no-trunc")
+	for _, f := range filters {
 		args = append(args, "--filter", f)
 	}
-	out, err := dc.run(ctx, args...)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Fields(strings.TrimSpace(out))
-	if len(lines) == 1 && lines[0] == "" {
-		return nil, nil
-	}
-	return lines, nil
+	return args
 }
 
 func (dc *dockerClient) pullImage(ctx context.Context, image string) error {
@@ -287,7 +293,7 @@ func (dc *dockerClient) watchContainerDeaths(ctx context.Context, onDie func(con
 	cmd := exec.CommandContext(ctx, "docker", "events",
 		"--filter", "type=container",
 		"--filter", "event=die",
-		"--filter", "label="+containerLabelManaged+"="+containerLabelManagedVal,
+		"--filter", managedLabelFilter,
 		"--format", "{{json .}}")
 	cmd.Env = append(os.Environ(), "DOCKER_HOST="+dc.host)
 

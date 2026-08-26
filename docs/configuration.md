@@ -114,7 +114,6 @@ Slots give the host-side Firecracker resources stable names without exposing tho
 | `SANDBOX_RUNNER_FIRECRACKER_TEMPLATE_DIR` | `/srv/firecracker/template` | Directory containing the snapshot rootfs (`rootfs.ext4`) |
 | `SANDBOX_RUNNER_FIRECRACKER_SNAPSHOT_MEM_PATH` | `/srv/firecracker/snapshots/mem` | Host path bind-mounted into the jail as `/snapshot_mem` |
 | `SANDBOX_RUNNER_FIRECRACKER_SNAPSHOT_STATE_PATH` | `/srv/firecracker/snapshots/state` | Host path bind-mounted into the jail as `/snapshot_state`. When auto-create is enabled, must share a directory with `SNAPSHOT_MEM_PATH` |
-| `SANDBOX_RUNNER_FIRECRACKER_SNAPSHOT_VIRTIO_BLOCK_PATH` | `/rootfs.ext4` | Rootfs path expected by the snapshot metadata |
 | `SANDBOX_RUNNER_FIRECRACKER_GUEST_IP` | `172.16.0.10` | Guest IP expected by the restored snapshot |
 | `SANDBOX_RUNNER_FIRECRACKER_HOST_TAP_DEVICE_NAME` | `fc-tap-0` | TAP device name inside each sandbox netns |
 | `SANDBOX_RUNNER_FIRECRACKER_HOST_TAP_IP_CIDR` | `172.16.0.1/24` | Host-side TAP address inside each sandbox netns |
@@ -134,6 +133,8 @@ On startup, `Prepare` configures host NAT (retried on transient failure), pins g
 #### Golden snapshot boot parameters (`boot.json`)
 
 `create-golden-snapshot.sh` writes `boot.json` into its `--out` directory alongside `snapshot_mem` and `snapshot_state`, recording the exact values it sent to the Firecracker API: `vcpu_count`, `mem_size_mib`, `kernel_image_path`, the verbatim `boot_args`, `rootfs_drive_path`, `guest_mac`, `guest_ip`, `host_tap_device_name` and `daemon_port`. Paths are as Firecracker sees them inside the jail.
+
+`kernel_image_path` and `rootfs_drive_path` are where the runner bind-mounts those two assets into each sandbox's jail, so there is no environment variable for either: the snapshot was built with the drive at the path it records, and a cold boot asks Firecracker to open the paths it records, so a runner-side setting could only ever agree with them by coincidence. Both must be absolute and free of `.` or `..` segments, since each is a mount target under the jail root.
 
 The sidecar exists because most of these have no equivalent in the runner's own configuration. Memory and vCPU count in particular are chosen by the create script (via its `MEM_MIB` and `VCPUS` environment variables) and the runner never learns them, which is fine while it only ever restores the snapshot but not once it has to boot a replacement VM for a guest that died. Recording them at build time keeps recovery pinned to how the snapshot was actually built rather than to whatever the runner's configuration happens to say later, which also lets a host serve several snapshot flavours.
 

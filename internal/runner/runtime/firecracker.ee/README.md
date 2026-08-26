@@ -253,6 +253,14 @@ guest would otherwise have to invent them. Recording them at build time keeps
 that boot faithful to how the snapshot was built, and keeps each sandbox pinned
 to its own snapshot lineage once a host serves more than one flavour.
 
+The two jail paths are also where `prepareJail` bind-mounts those assets, which is
+why neither has a `Config` field either. Both of their readers name the sidecar's
+value — the restore opens the drive where the snapshot was built with it, and a
+cold boot asks Firecracker for the paths it replays from the sidecar — so a
+runner-side path could only agree with them by coincidence, and a sandbox created
+from a rebuilt snapshot could not follow its own lineage. Being mount targets
+under the jail root, both are required absolute and free of `.` or `..` segments.
+
 Admission rejects a snapshot whose `guest_ip`, `host_tap_device_name`,
 `daemon_port` or `boot_args` gateway contradicts the runner: those are baked into
 the guest or the restored device model, so a mismatch yields sandboxes that never
@@ -367,7 +375,9 @@ boot: which path an activation takes is not known when the jail is built, and a
 sandbox created from its snapshot can be cold booted later on the same jail. It goes
 at the jail path the sandbox's own sidecar records, with the template's ownership and
 mode — Firecracker only reads it, and the mount shares an inode with an asset every
-sandbox on the host uses.
+sandbox on the host uses. `cleanupHost` unmounts it along with the rest, because the
+`rm -rf` that ends cleanup cannot delete a directory holding an active mount: a kernel
+left mounted fails the whole teardown, and the sandbox goes on holding its slot.
 
 A recovery is reported, an ordinary wake is not. `EnsureSandboxRunning` returns
 `WakeResult{Recovered}`, and the runner's proxy turns that into `409

@@ -204,11 +204,22 @@ export async function execWithTransientRetry(
  *
  * On Firecracker the VMM process exits, which is what the runner detects. On
  * Docker the container exits and its restart policy brings it back.
+ *
+ * Sent as a bare request rather than through `exec`, because the SDK reacts to
+ * the dropped stream the way any client would: it resumes the execution over
+ * `GET /executions/{exec_id}`, then deletes it. Both routes wake a stopped
+ * sandbox and report the recovery as a 409, by design — so going through the SDK
+ * recovers the very crash the caller asked for, before the caller can observe
+ * it. The stream is abandoned instead of read for the same reason.
  */
 export async function crashGuest(id: string): Promise<void> {
-  await ensureTenantAuth();
   try {
-    await exec(id, 'kill -TERM 1');
+    const res = await fetch(`${BASE_URL}/sandboxes/${id}/executions`, {
+      method: 'POST',
+      headers: await headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ command: 'kill -TERM 1' }),
+    });
+    await res.body?.cancel();
   } catch {
     // Shutdown is graceful, so this call normally returns before the guest goes
     // down — but a dropped connection is the requested outcome, not a failure.

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/n8n-io/sandbox-service/internal/metrics"
@@ -40,11 +41,23 @@ func proxyTestRequest() *http.Request {
 // then, so a 200 here would look entirely healthy while the processes an earlier
 // request started, and the daemon's execution history, are gone — a loss the client
 // would otherwise meet as a bug in its own code.
-func TestProxyHandlersRefuseTheRequestThatRecoveredTheSandbox(t *testing.T) {
+//
+// The retry is the other half, and the reason refusing is safe at all: the recovery
+// runs before the refusal, so the sandbox is reachable by the time the client comes
+// back and the retry the 409 asks for is not a gamble. Both are asserted here
+// because either alone passes for a broken handler — one that refuses without ever
+// recovering leaves the client retrying into a sandbox that is still down, and one
+// that recovers without refusing hands back the silent 200 the status exists to
+// prevent.
+func TestProxyHandlersRefuseARecoveryThenServeTheRetry(t *testing.T) {
 	for name, newHandler := range wakingHandlers {
 		t.Run(name, func(t *testing.T) {
-			daemon := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-				t.Error("proxied a request whose sandbox had just been recovered under it")
+			var daemonHits atomic.Int32
+			daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				daemonHits.Add(1)
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(exitEvent(1) + "\n"))
 			}))
 			defer daemon.Close()
 
@@ -53,11 +66,16 @@ func TestProxyHandlersRefuseTheRequestThatRecoveredTheSandbox(t *testing.T) {
 				daemonErr: runnerruntime.ErrSandboxNotRunning,
 				recovered: true,
 			}
+			handler := newHandler(rt, proxyTestConfig(), metrics.NewRunnerRecorder(false))
+
 			rec := httptest.NewRecorder()
-			newHandler(rt, proxyTestConfig(), metrics.NewRunnerRecorder(false)).ServeHTTP(rec, proxyTestRequest())
+			handler.ServeHTTP(rec, proxyTestRequest())
 
 			if rec.Code != http.StatusConflict {
 				t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+			}
+			if got := daemonHits.Load(); got != 0 {
+				t.Errorf("daemon hits = %d, want 0: a request whose sandbox was recovered under it must not be proxied", got)
 			}
 			if got := rec.Header().Get(sandboxproxy.SandboxRestartedHeader); got != "1" {
 				t.Errorf("%s = %q, want 1; it is the channel that survives both proxy hops", sandboxproxy.SandboxRestartedHeader, got)
@@ -74,6 +92,22 @@ func TestProxyHandlersRefuseTheRequestThatRecoveredTheSandbox(t *testing.T) {
 			}
 			if payload.Error == "" {
 				t.Error("body has no error message to show a client")
+			}
+
+			// The retry the 409 asked for, on the same runtime the refusal left behind.
+			// It reaches the daemon without driving a second wake, which is what makes it
+			// deterministic rather than a client guessing when to come back.
+			retry := httptest.NewRecorder()
+			handler.ServeHTTP(retry, proxyTestRequest())
+
+			if retry.Code != http.StatusOK {
+				t.Fatalf("retry status = %d, want 200: %s", retry.Code, retry.Body.String())
+			}
+			if got := retry.Header().Get(sandboxproxy.SandboxRestartedHeader); got != "" {
+				t.Errorf("retry %s = %q, want it unset: one crash is reported once", sandboxproxy.SandboxRestartedHeader, got)
+			}
+			if got := daemonHits.Load(); got != 1 {
+				t.Errorf("daemon hits = %d, want 1: the retry has to land on the recovered sandbox", got)
 			}
 		})
 	}

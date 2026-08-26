@@ -152,8 +152,9 @@ Related series:
 - `sandbox_recoveries_total{result}` — recovery attempts, one per crash rather
   than one per request the crash stranded. Read against the death counter: deaths
   without recoveries are crashed sandboxes nobody came back to, and
-  `result="failure"` is one the runner could not bring back, including a sandbox
-  refused for want of capacity before any boot was attempted.
+  `result="error"` is one the runner could not bring back, including a sandbox
+  refused for want of capacity before any boot was attempted. `result` carries
+  `success` or `error`, the same pair as every other `result` label here.
 - `sandbox_container_operation_duration_seconds{operation}` — the totals the
   steps add up to, a recovery's under `operation="recover"` like its steps.
 - `sandbox_http_request_duration_seconds{role,route,method}` — end-to-end per

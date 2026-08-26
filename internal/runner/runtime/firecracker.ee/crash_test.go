@@ -371,7 +371,7 @@ func TestRecoveryReplaysTheBootParametersTheSandboxWasCreatedFrom(t *testing.T) 
 }
 
 // waitForColdBoot blocks until a cold boot has started, which is the point at which
-// every caller of the burst is either waiting on it or about to be.
+// the recovery is under way and its caller is parked inside it.
 func waitForColdBoot(t *testing.T, coldBoots *atomic.Int32) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -414,14 +414,38 @@ func TestConcurrentRequestsAfterACrashShareOneRecoveryAndAllLearnOfIt(t *testing
 	var wg sync.WaitGroup
 	results := make([]runnerruntime.WakeResult, callers)
 	errs := make([]error, callers)
-	for i := range callers {
+
+	// One caller drives the recovery and parks inside the cold boot. Starting it alone
+	// and waiting for it is what makes the rest joiners rather than a race for the
+	// role: the flight is open before any of them calls.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results[0], errs[0] = rt.EnsureSandboxRunning(context.Background(), sandboxID)
+	}()
+	waitForColdBoot(t, &coldBoots)
+
+	var joining sync.WaitGroup
+	joining.Add(callers - 1)
+	for i := 1; i < callers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			joining.Done()
 			results[i], errs[i] = rt.EnsureSandboxRunning(context.Background(), sandboxID)
 		}()
 	}
-	waitForColdBoot(t, &coldBoots)
+	joining.Wait()
+
+	// joining.Done lands just before the call rather than inside the singleflight, so
+	// the last joiner can still be a few instructions short of registering. The leader
+	// is parked in the cold boot and cannot finish before the release below, so pausing
+	// here costs the test nothing and buys those joiners their scheduling. Without it
+	// the burst quietly becomes a sequence on a loaded machine: a caller that arrives
+	// after the recovery finished finds the sandbox running and is told there was
+	// nothing to recover, which is the assertion below failing for a scheduling reason
+	// rather than a behavioural one.
+	time.Sleep(50 * time.Millisecond)
 	close(release)
 	wg.Wait()
 

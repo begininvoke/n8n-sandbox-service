@@ -132,13 +132,21 @@ test.describe('Docker guest crash recovery', DOCKER_ONLY, () => {
     const deathsBefore = parseCounter(scrapeRunnerMetrics(), GUEST_DEATHS, RUNNER_LABELS);
 
     const id = await createSandboxWithRetry();
-    expect(await exec(id, `printf '%s' alive`)).toHaveSucceeded();
-    await deleteSandbox(id);
+    try {
+      expect(await exec(id, `printf '%s' alive`)).toHaveSucceeded();
+      await deleteSandbox(id);
 
-    // Docker reports the death of a running container the runner removed exactly as it
-    // reports a crash; only the runner knows which it asked for. Reading this one as a
-    // crash would count a guest death on every delete.
-    await sleep(3_000);
-    expect(parseCounter(scrapeRunnerMetrics(), GUEST_DEATHS, RUNNER_LABELS)).toBe(deathsBefore);
+      // Docker reports the death of a running container the runner removed exactly as it
+      // reports a crash; only the runner knows which it asked for. Reading this one as a
+      // crash would count a guest death on every delete.
+      await sleep(3_000);
+      expect(parseCounter(scrapeRunnerMetrics(), GUEST_DEATHS, RUNNER_LABELS)).toBe(deathsBefore);
+    } finally {
+      // The delete above is the action under test, not cleanup, so on the happy path
+      // this second one is a 404 the helper swallows. It earns its place when an
+      // assertion before it throws: this runner has one slot per sandbox and a leaked
+      // container would starve every spec that follows.
+      await deleteSandbox(id);
+    }
   });
 });

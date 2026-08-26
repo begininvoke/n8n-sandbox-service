@@ -64,14 +64,21 @@ func (m *Runtime) handleContainerDeath(containerID, sandboxID string) {
 
 // expectedStopTTL bounds how long a recorded stop can excuse a death. Docker emits
 // the event within milliseconds of the stop it is asked for, so anything older is a
-// stop that never produced one — a stop that failed, or a container that was already
-// exited when it was removed — and a mark kept past that would eventually excuse a
-// real crash of a container whose ID it no longer refers to.
+// stop that never produced one — a container that was already exited when it was
+// removed — and a mark kept past that would eventually excuse a real crash of a
+// container whose ID it no longer refers to. A stop that reported failure does not
+// wait for this bound; see forgetExpectedStop.
 const expectedStopTTL = 2 * time.Minute
 
 // expectStop records that the runner is about to stop or remove a container, so the
 // die event that follows is not read as a crash. Keyed by container rather than
 // sandbox because that is what every caller has, and what the event names.
+//
+// The key has to be the full container ID, since that is what the event carries.
+// Every ID in this package is one — see containerIDArgs, which is why.
+//
+// Recorded before the call it excuses, not after, because the event races the call's
+// return and usually wins.
 func (m *Runtime) expectStop(containerID string) {
 	if containerID == "" {
 		return
@@ -87,6 +94,22 @@ func (m *Runtime) expectStop(containerID string) {
 		}
 	}
 	m.expectedStops[containerID] = now
+}
+
+// forgetExpectedStop drops the mark for a stop that reported failure. Without this
+// the container keeps running with a mark that outlives its own reason, and a real
+// crash arriving within expectedStopTTL is read as the stop that never happened —
+// served with no 409 and with network rules still naming the address the container
+// had.
+//
+// A stop that failed after killing the container loses the race and is read as a
+// crash instead. That is the right way round: a spurious restart report costs the
+// client a retry, and on this runtime it is not even spurious, since a stopped
+// container comes back from docker start without the memory it had.
+func (m *Runtime) forgetExpectedStop(containerID string) {
+	m.mu.Lock()
+	delete(m.expectedStops, containerID)
+	m.mu.Unlock()
 }
 
 // takeExpectedStop consumes one expected stop for a container. Consuming rather than

@@ -203,7 +203,12 @@ test.describe('Guest crash detection', FIRECRACKER_ONLY, () => {
 
     const id = await createSandboxWithRetry();
     try {
-      expect(await exec(id, `printf '%s' survives-a-crash > /tmp/crash-marker`)).toHaveSucceeded();
+      // Synced, because the crash is a kernel panic: it takes the guest's page cache
+      // with it, and ext4 would not have committed a write this recent on its own.
+      // What survives a crash is what reached the disk, so that is what this asserts.
+      expect(
+        await exec(id, `printf '%s' survives-a-crash > /tmp/crash-marker && sync`),
+      ).toHaveSucceeded();
       expect(await exec(id, LISTENER_START)).toHaveSucceeded();
       expect(await exec(id, LISTENER_PROBE)).toHaveSucceeded();
 

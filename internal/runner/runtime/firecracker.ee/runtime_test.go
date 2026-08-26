@@ -76,22 +76,21 @@ func stubCreateDeps(rt *Runtime) {
 
 func testConfig() Config {
 	return Config{
-		JailerBin:               "/opt/firecracker/bin/jailer",
-		FirecrackerBin:          "/opt/firecracker/bin/firecracker",
-		JailerBaseDir:           "/srv/jailer",
-		TemplateDir:             "/srv/firecracker/template",
-		SnapshotMemPath:         "/srv/firecracker/snapshots/mem",
-		SnapshotStatePath:       "/srv/firecracker/snapshots/state",
-		SnapshotVirtioBlockPath: "/rootfs.ext4",
-		GuestIP:                 "172.16.0.10",
-		HostTapDeviceName:       "fc-tap-0",
-		HostTapIPCIDR:           "172.16.0.1/24",
-		DaemonPort:              8081,
-		ProxyListenIP:           "127.0.0.1",
-		ProxyPortStart:          18081,
-		SocketWaitAttempts:      1,
-		SocketWaitInterval:      time.Nanosecond,
-		DaemonWaitTimeout:       time.Second,
+		JailerBin:          "/opt/firecracker/bin/jailer",
+		FirecrackerBin:     "/opt/firecracker/bin/firecracker",
+		JailerBaseDir:      "/srv/jailer",
+		TemplateDir:        "/srv/firecracker/template",
+		SnapshotMemPath:    "/srv/firecracker/snapshots/mem",
+		SnapshotStatePath:  "/srv/firecracker/snapshots/state",
+		GuestIP:            "172.16.0.10",
+		HostTapDeviceName:  "fc-tap-0",
+		HostTapIPCIDR:      "172.16.0.1/24",
+		DaemonPort:         8081,
+		ProxyListenIP:      "127.0.0.1",
+		ProxyPortStart:     18081,
+		SocketWaitAttempts: 1,
+		SocketWaitInterval: time.Nanosecond,
+		DaemonWaitTimeout:  time.Second,
 	}
 }
 
@@ -423,8 +422,11 @@ func TestRuntimeDeleteSandboxDoesNotReleaseReassignedSlot(t *testing.T) {
 	rt := testRuntime(1)
 	rt.deps.run = func(context.Context, string, ...string) error { return nil }
 
-	oldState := &sandboxState{id: "sandbox-id-old123", slot: 0}
-	newState := &sandboxState{id: "sandbox-id-new456", slot: 0}
+	// bootParams as reserveSandbox would have set it: the teardown below reads the
+	// jail paths from it, and no sandbox exists without one.
+	params := testBootParams(rt.config)
+	oldState := &sandboxState{id: "sandbox-id-old123", slot: 0, bootParams: &params}
+	newState := &sandboxState{id: "sandbox-id-new456", slot: 0, bootParams: &params}
 	rt.sandboxes[newState.id] = newState
 	rt.slots[0].sandboxID = newState.id
 
@@ -533,14 +535,22 @@ func TestRuntimeCreateSandboxReleasesSlotWhenCleanupFails(t *testing.T) {
 // same jail. It comes from the template, at the jail path the sandbox's own sidecar
 // records, and is left with the template's ownership because a bind mount shares
 // the inode with an asset every sandbox on the host uses.
+//
+// The teardown has to unmount it too. rm cannot delete a live mountpoint, so a
+// kernel left mounted fails the whole cleanup, and the sandbox keeps its slot: on
+// a capacity-1 host that is an admission canary that can never be reclaimed and a
+// runner that stays unhealthy for the rest of its life.
 func TestPrepareJailBindsTheKernelForALaterColdBoot(t *testing.T) {
 	rt := testRuntimeT(t, 1)
 	stubCreateDeps(rt)
 
-	var prepareScript string
+	var prepareScript, cleanupScript string
 	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
-		if script := args[len(args)-1]; strings.Contains(script, "mount --bind") && prepareScript == "" {
+		switch script := args[len(args)-1]; {
+		case strings.Contains(script, "mount --bind") && prepareScript == "":
 			prepareScript = script
+		case strings.Contains(script, "umount -l") && cleanupScript == "":
+			cleanupScript = script
 		}
 		return nil
 	}
@@ -557,6 +567,61 @@ func TestPrepareJailBindsTheKernelForALaterColdBoot(t *testing.T) {
 	}
 	if strings.Contains(prepareScript, "chown 1000:1000 "+filepath.Join(jailRoot, "vmlinux")) {
 		t.Error("prepare jail chowns the shared template kernel through its bind mount")
+	}
+
+	if err := rt.DeleteSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if want := "umount -l '" + filepath.Join(jailRoot, "vmlinux") + "'"; !strings.Contains(cleanupScript, want) {
+		t.Errorf("cleanup script does not unmount the kernel the jail prep mounted:\nwant %s\ngot\n%s", want, cleanupScript)
+	}
+}
+
+// The rootfs goes in at the jail path the sandbox's own sidecar records, because
+// that is the path both of its readers name: the snapshot was built with the drive
+// there, and a cold boot asks Firecracker to open whatever the sidecar says. A
+// mount anywhere else is a file neither of them finds. The teardown has to undo
+// the same path, or a delete leaves the sandbox's rootfs pinned under the jail.
+func TestJailMountsTheRootfsWhereTheSidecarRecordsIt(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	// A snapshot built with its drive somewhere other than the default.
+	params := testBootParams(rt.config)
+	params.RootfsDrivePath = "/data/rootfs.ext4"
+	rt.deps.loadBootParams = func(string) (*bootParams, error) {
+		p := params
+		return &p, nil
+	}
+
+	var prepareScript, cleanupScript string
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		switch script := args[len(args)-1]; {
+		case strings.Contains(script, "mount --bind") && prepareScript == "":
+			prepareScript = script
+		case strings.Contains(script, "umount -l") && cleanupScript == "":
+			cleanupScript = script
+		}
+		return nil
+	}
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+
+	jailRoot := filepath.Join(rt.config.JailerBaseDir, "firecracker", "sandbox-"+shortID(sandboxID), "root")
+	target := filepath.Join(jailRoot, "data", "rootfs.ext4")
+	wantMount := "mount --bind '" + sandboxRootfsPath(rt.runnerConfig.DataDir, sandboxID) + "' '" + target + "'"
+	if !strings.Contains(prepareScript, wantMount) {
+		t.Errorf("prepare jail script does not bind the rootfs where the sidecar records it:\nwant %s\ngot\n%s", wantMount, prepareScript)
+	}
+
+	if err := rt.DeleteSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if want := "umount -l '" + target + "'"; !strings.Contains(cleanupScript, want) {
+		t.Errorf("cleanup script does not unmount the rootfs the jail prep mounted:\nwant %s\ngot\n%s", want, cleanupScript)
 	}
 }
 

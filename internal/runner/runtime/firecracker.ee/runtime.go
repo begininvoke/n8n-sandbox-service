@@ -174,6 +174,10 @@ type sandboxState struct {
 	// descendant of: an operator who rebuilds or swaps the golden snapshot mid-life
 	// would otherwise have existing sandboxes cold-boot with another build's memory
 	// size, kernel and init= — against a rootfs that no longer matches.
+	//
+	// Its two jail paths are also where prepareJail mounts those assets, so they
+	// have to be the sidecar's values rather than runner settings: the create script
+	// chose them, and a runner-side path could only agree by coincidence.
 	bootParams *bootParams
 
 	process    process
@@ -683,17 +687,20 @@ func (s *sandboxState) daemonURLAddr() string {
 // prepareJail creates the jail root and bind-mounts snapshot assets at the
 // paths expected by the restored Firecracker snapshot.
 //
+// Both assets are mounted at the jail paths the sandbox's own sidecar records,
+// because those are the paths their consumers name: the restore opens the rootfs
+// where the snapshot was built with it, and the cold boot asks Firecracker for
+// both by the values it replays from that same sidecar.
+//
 // The kernel goes in unconditionally, even though only a cold boot reads it: one
 // jail prep then serves both paths, and which one a sandbox takes is not known
 // until it is activated — a sandbox can be created from its snapshot and cold
-// booted later, on the same jail. It is mounted at the jail path its own sidecar
-// records, since that is the path the cold boot asks Firecracker to load, and is
-// left with the template's own ownership and mode: Firecracker only reads it, and
-// a bind mount shares the inode, so chowning it would rewrite an asset every other
-// sandbox on the host shares.
+// booted later, on the same jail. It is left with the template's own ownership and
+// mode: Firecracker only reads it, and a bind mount shares the inode, so chowning
+// it would rewrite an asset every other sandbox on the host shares.
 func (r *Runtime) prepareJail(ctx context.Context, state *sandboxState) error {
 	jailRoot := filepath.Join(r.config.JailerBaseDir, "firecracker", state.vmID, "root")
-	rootfsTarget := filepath.Join(jailRoot, strings.TrimPrefix(r.config.SnapshotVirtioBlockPath, "/"))
+	rootfsTarget := filepath.Join(jailRoot, strings.TrimPrefix(state.bootParams.RootfsDrivePath, "/"))
 	kernelTarget := filepath.Join(jailRoot, strings.TrimPrefix(state.bootParams.KernelImagePath, "/"))
 	script := fmt.Sprintf(`
 set -eu
@@ -766,6 +773,10 @@ func (r *Runtime) waitForSocket(ctx context.Context, socketPath string) error {
 // cleanupHost removes the bind mounts, network namespace, and jail directory
 // created for a sandbox. It is intentionally best-effort at the shell level.
 //
+// It has to undo every mount prepareJail made, the kernel's included: the final
+// rm cannot delete a live mountpoint, so one mount left behind fails the whole
+// cleanup, and a failed cleanup is what keeps a sandbox holding its slot.
+//
 // Every name it needs is one the slot reservation wrote and no teardown touches,
 // which is why hostVeth is carried on the state rather than derived from the slot
 // here: two teardowns can run this concurrently — a guest death racing shutdown —
@@ -773,16 +784,18 @@ func (r *Runtime) waitForSocket(ctx context.Context, socketPath string) error {
 // released and set to -1, naming a device that does not exist.
 func (r *Runtime) cleanupHost(ctx context.Context, state *sandboxState) error {
 	jailDir := filepath.Join(r.config.JailerBaseDir, "firecracker", state.vmID)
-	rootfsTarget := filepath.Join(jailDir, "root", strings.TrimPrefix(r.config.SnapshotVirtioBlockPath, "/"))
+	rootfsTarget := filepath.Join(jailDir, "root", strings.TrimPrefix(state.bootParams.RootfsDrivePath, "/"))
+	kernelTarget := filepath.Join(jailDir, "root", strings.TrimPrefix(state.bootParams.KernelImagePath, "/"))
 	script := fmt.Sprintf(`
 set -eu
 umount -l %[1]s/root/snapshot_mem 2>/dev/null || true
 umount -l %[1]s/root/snapshot_state 2>/dev/null || true
 umount -l %[3]s 2>/dev/null || true
+umount -l %[5]s 2>/dev/null || true
 %[4]s
 rm -rf %[1]s
 `, shellquote.Quote(jailDir), shellquote.Quote(state.netnsName), shellquote.Quote(rootfsTarget),
-		strings.TrimSpace(fcnetwork.CleanupScript(state.netnsName, state.hostVeth)))
+		strings.TrimSpace(fcnetwork.CleanupScript(state.netnsName, state.hostVeth)), shellquote.Quote(kernelTarget))
 	return r.deps.run(ctx, "sudo", "/bin/sh", "-c", script)
 }
 

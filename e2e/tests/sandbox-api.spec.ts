@@ -179,9 +179,9 @@ test.describe('Exec', () => {
     const killed = await exec(sandboxId, 'kill -9 1');
     expect(killed).toHaveSucceeded();
 
-    const after = await exec(sandboxId, `printf '%s' still-here`);
+    const after = await exec(sandboxId, 'echo still-here');
     expect(after).toHaveSucceeded();
-    expect(after.stdout).toBe('still-here');
+    expect(after.stdout).toBe('still-here\n');
   });
 
   test('environment variables as map', async () => {
