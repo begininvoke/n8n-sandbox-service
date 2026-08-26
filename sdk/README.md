@@ -158,7 +158,7 @@ try {
 
 ### Sandbox restarts
 
-If a sandbox's guest crashes, the service recovers it by rebooting its filesystem and then fails the request that triggered the recovery with `SandboxRestartedError` (HTTP 409). **The files are intact; everything that was in memory is not.** Retry the request once — the sandbox is already running again — and relaunch anything the sandbox was running in the background:
+If a sandbox's guest crashes, the service recovers it by rebooting its filesystem and then fails the request that triggered the recovery with `SandboxRestartedError` (HTTP 409). The files are intact; everything that was in memory is not. Retry the request once — the sandbox is already running again — and relaunch whatever it was running in the background:
 
 ```ts
 import { SandboxRestartedError } from '@n8n/sandbox-client';
@@ -175,7 +175,7 @@ try {
 }
 ```
 
-This error is never retried automatically, by design: an invisible retry would hand back a working sandbox and hide the loss. Two consequences worth planning for — a completed execution is no longer readable after a restart (`getExecution` returns 404), and a caller-supplied `execId` is no longer idempotent, so re-posting one that ran before the restart runs the command again.
+It is never retried automatically, by design: an invisible retry would hand back a working sandbox and hide the loss. Two consequences to plan for — a completed execution is no longer readable (`getExecution` returns 404), and a caller-supplied `execId` is no longer idempotent, so re-posting one that ran before the restart runs the command again.
 
 ## Development
 

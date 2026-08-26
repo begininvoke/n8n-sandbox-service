@@ -339,11 +339,11 @@ those failures leave the sandbox restorable.
 A wake reads the pin and takes one of two paths, in `startGuest`: `snapshot/load` for
 a sandbox with a matching snapshot, or `coldBoot` for one without. Both leave the pin
 set — a restored guest resumes onto a rootfs its snapshot stops describing the moment
-it runs, and a cold booted one never had a matching snapshot at all — so the rule is
-the same either way: only the snapshot `StopSandbox` takes of a paused guest clears
-it. Nothing else about the wake changes. It re-reserves a slot, prepares the same
-jail, and comes back with its files intact; what is gone is everything that was in
-memory, which is the loss the caller has to report.
+it runs, and a cold booted one never had a matching snapshot at all — so only the
+snapshot `StopSandbox` takes of a paused guest clears it either way. Nothing else
+about the wake changes: it re-reserves a slot, prepares the same jail, and comes back
+with its files intact. What is gone is everything that was in memory, which is the
+loss the caller has to report.
 
 `boot.go` is a transcription of the five requests
 [create-golden-snapshot.sh](../../../../scripts/firecracker.ee/create-golden-snapshot.sh)
@@ -354,37 +354,36 @@ standalone on runner VMs, and [RELEASE.md](../../../../docs/RELEASE.md) rebuilds
 golden snapshot before rolling the runner image, so the matching binary is not on the
 host yet. They share `boot.json` instead, which is why the sidecar exists.
 
-**Boot parameters travel per sandbox, not per runner.** `reserveSandbox` resolves the
+Boot parameters travel per sandbox, not per runner. `reserveSandbox` resolves the
 sidecar once, when a sandbox is first tied to a golden snapshot, and stores it on
 `sandboxState`; recovery replays that copy and never re-reads configuration. An
 operator who rebuilds or swaps the golden snapshot under a running runner would
-otherwise have sandboxes created before the swap cold boot with another build's
-memory size, kernel and `init=`, against a rootfs matching none of it. When several
-golden snapshots land, the resolver in `reserveSandbox` is the only thing that has to
-change.
+otherwise have sandboxes created before the swap cold boot with another build's memory
+size, kernel and `init=`, against a rootfs matching none of it. When several golden
+snapshots land, the resolver in `reserveSandbox` is the only thing that has to change.
 
-The kernel is bind-mounted into every jail by `prepareJail`, not only into one about
-to cold boot: which path an activation takes is not known when the jail is built, and
-a sandbox created from its snapshot can be cold booted later on the same jail. It is
-mounted at the jail path the sandbox's own sidecar records, and left with the
-template's ownership and mode — Firecracker only reads it, and a bind mount shares the
-inode with an asset every sandbox on the host uses.
+`prepareJail` bind-mounts the kernel into every jail, not only into one about to cold
+boot: which path an activation takes is not known when the jail is built, and a
+sandbox created from its snapshot can be cold booted later on the same jail. It goes
+at the jail path the sandbox's own sidecar records, with the template's ownership and
+mode — Firecracker only reads it, and the mount shares an inode with an asset every
+sandbox on the host uses.
 
-**A recovery is reported, an ordinary wake is not.** `EnsureSandboxRunning` returns
+A recovery is reported, an ordinary wake is not. `EnsureSandboxRunning` returns
 `WakeResult{Recovered}`, and the runner's proxy turns that into `409
 sandbox_restarted` for the request that drove it rather than proxying it — see
 [API.md](../../../../docs/API.md#http-409-sandbox_restarted--the-sandbox-came-back-without-its-memory).
 The flag comes out of the wake singleflight, so every request stranded by the crash
 learns of it from the one recovery that served them all, and each recovery is timed
 under `metrics.OpRecover` with a `cold_boot` step where a wake has `load_snapshot`.
-Recovering before refusing is what makes the client's retry deterministic: by the time
-the 409 is written, the sandbox is up.
+Recovering before refusing is what makes the retry deterministic: by the time the 409
+is written, the sandbox is up.
 
-The flag is also set on a recovery that failed, next to the error, which is what lets
-the outcome be counted at all: `sandbox_recoveries_total` is incremented inside the
-singleflight — once per crash rather than once per stranded request — and covers every
-way the wake can fail, including a sandbox refused for want of capacity before any
-cold boot was attempted. A caller must check the error before reading the flag.
+The flag is set on a failed recovery too, next to the error, which is what lets the
+outcome be counted: `sandbox_recoveries_total` is incremented inside the singleflight
+— once per crash, not once per stranded request — and covers every way the wake can
+fail, including a sandbox refused for want of capacity before any cold boot was
+attempted. Check the error before reading the flag.
 
 ## Current Limitations
 

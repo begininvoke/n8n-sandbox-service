@@ -103,8 +103,8 @@ Steps, in order:
 | `probe_daemon` | create, wake, recover | First successful call to the in-guest daemon |
 
 A wake skips the two clone steps, since the sandbox's disk already exists. A
-recovery skips them too and swaps `load_snapshot` for `cold_boot`, which is the
-field to look at when comparing recovery latency against an ordinary wake.
+recovery skips them too and swaps `load_snapshot` for `cold_boot` — the field to
+compare when reading recovery latency against an ordinary wake.
 
 ### Runner: guest deaths
 
@@ -119,10 +119,10 @@ or a reboot from inside the guest. It has no `trace_id`: nothing requested it.
 
 The runner then tears the dead microVM down and hands its slot back, so the
 sandbox goes on to report as stopped with its files intact. Nothing is recovered
-until a request arrives; that request cold boots the sandbox's own rootfs — it is
-never restored from its snapshot, which the guest wrote past — and is then failed
-with `409 sandbox_restarted`. The recovery is the `firecracker sandbox woke` event
-with `op=recover`.
+until a request arrives; that request cold boots the sandbox's own rootfs — never
+its snapshot, which the guest wrote past — and is then failed with
+`409 sandbox_restarted`. The recovery is the `firecracker sandbox woke` event with
+`op=recover`.
 
 On the Docker runner the same crash reads differently, because Docker's restart
 policy has already brought the container back:
@@ -133,7 +133,7 @@ policy has already brought the container back:
 
 `docker guest died` comes from the runner's `docker events` stream rather than
 from a process it waits on, so a `docker event stream ended, reconnecting`
-warning is worth alerting on: while it is down, crashes are not reported and
+warning is worth alerting on: while it is down, crashes go unreported and
 restarted sandboxes are served without their `409`. Neither gauge moves for a
 Docker crash — the container never leaves — so the death counter is the only
 signal. The repair is `docker sandbox recovered`, emitted once the restarted
@@ -151,12 +151,11 @@ Related series:
   backend, for alerting on a crash rate the events alone would not surface.
 - `sandbox_recoveries_total{result}` — recovery attempts, one per crash rather
   than one per request the crash stranded. Read against the death counter: deaths
-  without matching recoveries are crashed sandboxes nobody came back to, while
-  `result="failure"` is a sandbox the runner could not bring back — including one
-  refused for want of capacity, before any boot was attempted.
+  without recoveries are crashed sandboxes nobody came back to, and
+  `result="failure"` is one the runner could not bring back, including a sandbox
+  refused for want of capacity before any boot was attempted.
 - `sandbox_container_operation_duration_seconds{operation}` — the totals the
-  steps add up to. A recovery's total is recorded under `operation="recover"`,
-  the same label as its steps.
+  steps add up to, a recovery's under `operation="recover"` like its steps.
 - `sandbox_http_request_duration_seconds{role,route,method}` — end-to-end per
   route on both binaries.
 
