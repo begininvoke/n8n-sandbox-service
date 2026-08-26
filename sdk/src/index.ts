@@ -1,5 +1,5 @@
 export { SandboxClient } from "./client";
-export { SandboxServiceError } from "./errors";
+export { SandboxServiceError, SandboxRestartedError } from "./errors";
 export type {
   SandboxClientOptions,
   CreateSandboxOptions,

@@ -156,6 +156,27 @@ try {
 
 `deleteSandbox` treats HTTP 404 as success (already gone), so a retried delete after a dropped `204` does not fail.
 
+### Sandbox restarts
+
+If a sandbox's guest crashes, the service recovers it by rebooting its filesystem and then fails the request that triggered the recovery with `SandboxRestartedError` (HTTP 409). **The files are intact; everything that was in memory is not.** Retry the request once — the sandbox is already running again — and relaunch anything the sandbox was running in the background:
+
+```ts
+import { SandboxRestartedError } from '@n8n/sandbox-client';
+
+try {
+  return await client.exec(sandboxId, { command: 'curl -s localhost:3000' });
+} catch (err) {
+  if (err instanceof SandboxRestartedError) {
+    // Files survived; the dev server this depends on did not.
+    await client.exec(sandboxId, { command: 'npm run dev &' });
+    return await client.exec(sandboxId, { command: 'curl -s localhost:3000' });
+  }
+  throw err;
+}
+```
+
+This error is never retried automatically, by design: an invisible retry would hand back a working sandbox and hide the loss. Two consequences worth planning for — a completed execution is no longer readable after a restart (`getExecution` returns 404), and a caller-supplied `execId` is no longer idempotent, so re-posting one that ran before the restart runs the command again.
+
 ## Development
 
 ```sh

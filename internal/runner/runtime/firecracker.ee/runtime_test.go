@@ -68,6 +68,7 @@ func stubCreateDeps(rt *Runtime) {
 	rt.deps.pauseVM = func(context.Context, string) error { return nil }
 	rt.deps.createSnapshot = func(context.Context, string) error { return nil }
 	rt.deps.loadSnapshot = func(context.Context, string, Config) error { return nil }
+	rt.deps.coldBoot = func(context.Context, string, *bootParams) error { return nil }
 	rt.deps.newProxy = func(context.Context, string, string, string) (daemonProxy, error) { return &fakeProxy{}, nil }
 	rt.deps.probeDaemon = func(context.Context, string) error { return nil }
 	rt.deps.freeBytesInDir = freeBytesInDir
@@ -108,7 +109,7 @@ func testRuntimeT(t *testing.T, capacity int32) *Runtime {
 // newTestRuntime constructs a runtime without startup reconcile (unit tests only).
 // ReadyCh stays open and admissionOK is false until markAdmissionOK is called.
 func newTestRuntime(capacity int32) *Runtime {
-	return &Runtime{
+	rt := &Runtime{
 		runnerConfig: testRunnerConfig(capacity),
 		config:       testConfig(),
 		deps:         defaultDependencies(testConfig()),
@@ -116,6 +117,14 @@ func newTestRuntime(capacity int32) *Runtime {
 		sandboxes:    make(map[string]*sandboxState),
 		readyCh:      make(chan struct{}),
 	}
+	// Part of the runtime's environment rather than a per-test stub: every sandbox
+	// is reserved against the sidecar of the snapshot it is created from, so without
+	// this no create reaches the behaviour under test.
+	rt.deps.loadBootParams = func(string) (*bootParams, error) {
+		params := testBootParams(rt.config)
+		return &params, nil
+	}
+	return rt
 }
 
 func TestRuntimeReadyChecksFirecrackerAssets(t *testing.T) {
@@ -518,6 +527,39 @@ func TestRuntimeCreateSandboxReleasesSlotWhenCleanupFails(t *testing.T) {
 	}
 }
 
+// The kernel is bound into every jail, including one that will restore a snapshot
+// and never read it: which path an activation takes is not known when the jail is
+// built, and a sandbox created from its snapshot can be cold booted later on the
+// same jail. It comes from the template, at the jail path the sandbox's own sidecar
+// records, and is left with the template's ownership because a bind mount shares
+// the inode with an asset every sandbox on the host uses.
+func TestPrepareJailBindsTheKernelForALaterColdBoot(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	var prepareScript string
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		if script := args[len(args)-1]; strings.Contains(script, "mount --bind") && prepareScript == "" {
+			prepareScript = script
+		}
+		return nil
+	}
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+
+	jailRoot := filepath.Join(rt.config.JailerBaseDir, "firecracker", "sandbox-"+shortID(sandboxID), "root")
+	wantMount := "mount --bind '" + filepath.Join(rt.config.TemplateDir, "vmlinux") + "' '" + filepath.Join(jailRoot, "vmlinux") + "'"
+	if !strings.Contains(prepareScript, wantMount) {
+		t.Errorf("prepare jail script does not bind the kernel:\nwant %s\ngot\n%s", wantMount, prepareScript)
+	}
+	if strings.Contains(prepareScript, "chown 1000:1000 "+filepath.Join(jailRoot, "vmlinux")) {
+		t.Error("prepare jail chowns the shared template kernel through its bind mount")
+	}
+}
+
 // A stop whose host cleanup failed still marks the sandbox stopped and drops its
 // process and proxy handles. The delete that follows has to clean up regardless, or
 // the jail's bind mounts go on pinning the snapshot files the delete removes, with
@@ -731,8 +773,14 @@ func TestRuntimeEnsureSandboxRunningWakesStoppedSandbox(t *testing.T) {
 	if err := rt.StopSandbox(context.Background(), "sandbox-id-123456"); err != nil {
 		t.Fatalf("StopSandbox() failed: %v", err)
 	}
-	if err := rt.EnsureSandboxRunning(context.Background(), "sandbox-id-123456"); err != nil {
+	wake, err := rt.EnsureSandboxRunning(context.Background(), "sandbox-id-123456")
+	if err != nil {
 		t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+	}
+	// An idle-stop wake stays transparent. Reporting it as a recovery would fail a
+	// request whose sandbox lost nothing, on every wake.
+	if wake.Recovered {
+		t.Error("an ordinary wake reported itself as a recovery")
 	}
 	if pauseCount != 1 {
 		t.Fatalf("pauseCount = %d, want 1", pauseCount)

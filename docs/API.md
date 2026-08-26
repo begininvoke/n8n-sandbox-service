@@ -44,6 +44,29 @@ The API and runner use two buckets so clients (including the SDK) can decide **w
 - **503 Service Unavailable** — **Transient / retry**: overload, no capacity yet, network or upstream not ready, or the sandbox daemon is not reachable *for the moment* while the container is otherwise expected to be usable. Safe to back off and retry the same operation.
 - **502 Bad Gateway** — **Not retryable as “wait and retry”**: the request does not make sense to repeat unchanged; fix state first (new sandbox, repair registry/routing, or handle the reported error). Examples: stored sandbox has **no runner HTTP base URL**, or **delete** failed on the runner control plane.
 
+### HTTP 409 `sandbox_restarted` — the sandbox came back without its memory
+
+A sandbox whose guest crashed is recovered automatically, by booting its existing filesystem. **Files survive; everything that was in memory does not.** The request that triggered the recovery blocks until it finishes and then fails with `409`, so the loss is reported exactly once rather than silently:
+
+```
+HTTP/1.1 409 Conflict
+X-Sandbox-Restarted: 1
+
+{"error":"sandbox restarted after guest crash; state in memory was lost","reason":"sandbox_restarted"}
+```
+
+**Retry once.** The sandbox is already running when this arrives, so the retry is expected to succeed — there is no `Retry-After` and nothing to wait for. Do not treat it as fatal, and do not retry it silently: the point of the status is that a client learns its sandbox is not the one it left behind.
+
+Match on `X-Sandbox-Restarted: 1`, which survives both proxy hops unchanged and is listed in `Access-Control-Expose-Headers` so browser clients can read it, or on the body's `reason` field. `reason` is a separate field from `code`, which carries the API's integer status. Only the first request after a crash sees this; every request already in flight sees it too, because they are all served by the one recovery. Later requests are ordinary `200`s. `status` in `GET /sandboxes/{id}` stays `running` throughout.
+
+What a restart costs the client, all of it client-visible:
+
+- **Running processes are gone.** A dev server or worker started by an earlier execution is dead, and nothing restarts it. Its files are still there, so relaunch it.
+- **Completed executions become unreadable.** The daemon keeps execution history in memory only, so `GET /sandboxes/{id}/executions/{exec_id}` returns `404 execution not found` even for a command that finished successfully before the crash.
+- **Caller-supplied `exec_id` loses idempotency.** Re-posting an id that ran before the restart runs the command again instead of returning the earlier result.
+
+An ordinary wake from an idle stop is unaffected and stays transparent — no `409`, no header.
+
 **404** `sandbox not found` — Unknown id, the sandbox is past its idle delete-after wake window (`SANDBOX_API_IDLE_DELETE_AFTER`, default `24h`), or the runner no longer tracks the sandbox (eviction, delete, or runner restart). On exec/file proxy routes, when the runner signals sandbox gone (`X-Sandbox-Gone: 1` or `{"error":"sandbox not found"}`), the API removes the store row so subsequent `GET /sandboxes/{id}` also returns 404. Other runner **404** responses (for example `execution not found` or missing file paths) do **not** delete the sandbox. Exec and file routes may return **503** or **502** from the runner after the API successfully reaches the runner; the API may return **503** `runner unavailable` before the runner is contacted.
 
 ---

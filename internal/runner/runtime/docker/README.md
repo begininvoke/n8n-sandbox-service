@@ -39,3 +39,33 @@ containers direct access to the host Docker daemon.
   one wake operation.
 - Best-effort reconciles and removes stale managed containers on startup and
   shutdown.
+- Detects guests that died on their own and reports the restart to the client.
+
+## Crash recovery
+
+Sandbox containers run with `--restart unless-stopped`, so Docker brings a died
+container back on its own — with its files, and without telling anyone. Two things
+are wrong with that on its own: the container can come back on a different IP, which
+its network policy does not know about, and the client is never told that everything
+the sandbox held in memory is gone.
+
+`crash.go` closes both. The runner subscribes to `docker events` filtered to `die`
+on its own containers, and reads every death it did not ask for as a crash. Deaths it
+did ask for are recorded before the stop or remove that causes them, and matched
+against the event — exit codes are never consulted, because a guest that exits `0` on
+its own has still lost what it was running, and a `docker stop` of a healthy sandbox
+produces the non-zero exit of a SIGTERM'd daemon. The recorded stops expire, so one
+that never produced a death cannot go on excusing a later crash of the same
+container.
+
+A sandbox marked that way is reported as not running by `DaemonURL` until the wake
+path has re-admitted it: reapplied its network policy for the address it came back
+on, and waited for its daemon. Reporting it that way is what forces a container that
+already looks healthy through that path, and what turns the restart into
+`WakeResult{Recovered}` — and from there into `409 sandbox_restarted` for the request
+that found it, exactly as on the Firecracker runner.
+
+The event stream is the weak point, because losing it is silent: containers keep
+working while crashes stop being reported. The watcher therefore reconnects for the
+life of the runner, and a death missed while it was down means a restart served
+without its `409`.

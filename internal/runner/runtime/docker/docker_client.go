@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -43,6 +44,17 @@ type containerState struct {
 	Dead       bool   `json:"Dead"`
 }
 
+// containerEvent is the subset of a `docker events` record this runtime reads.
+// Actor.ID is the container, and Actor.Attributes carries the container's labels,
+// which is how a die event names the sandbox that died without a second lookup —
+// the container is often already gone by the time the event is read.
+type containerEvent struct {
+	Actor struct {
+		ID         string            `json:"ID"`
+		Attributes map[string]string `json:"Attributes"`
+	} `json:"Actor"`
+}
+
 type networkInspect struct {
 	ID      string            `json:"Id"`
 	Name    string            `json:"Name"`
@@ -66,6 +78,7 @@ type dockerBackend interface {
 	listContainersByLabel(ctx context.Context, label, value string) ([]string, error)
 	findContainerByLabels(ctx context.Context, filterArgs ...string) ([]string, error)
 	pullImage(ctx context.Context, image string) error
+	watchContainerDeaths(ctx context.Context, onDie func(containerID, sandboxID string)) error
 	run(ctx context.Context, args ...string) (string, error)
 }
 
@@ -259,6 +272,54 @@ func (dc *dockerClient) pullImage(ctx context.Context, image string) error {
 	}
 	_, err := dc.run(ctx, "pull", image)
 	return err
+}
+
+// watchContainerDeaths calls onDie for every managed sandbox container that exits,
+// until ctx is canceled or the stream breaks. It is the only long-running docker
+// invocation in this package, so it streams rather than buffering like run does.
+//
+// The filters are the daemon's, not ours: asking it for die events on managed
+// containers means the runner is not woken for every image pull and exec on the
+// host. Callers get the events from the moment this connects — a death during a
+// reconnect is not replayed, which is why the wake path still repairs a container
+// it finds restarted rather than trusting the event alone.
+func (dc *dockerClient) watchContainerDeaths(ctx context.Context, onDie func(containerID, sandboxID string)) error {
+	cmd := exec.CommandContext(ctx, "docker", "events",
+		"--filter", "type=container",
+		"--filter", "event=die",
+		"--filter", "label="+containerLabelManaged+"="+containerLabelManagedVal,
+		"--format", "{{json .}}")
+	cmd.Env = append(os.Environ(), "DOCKER_HOST="+dc.host)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("pipe docker events: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start docker events: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		var event containerEvent
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			slog.Warn("decode docker event", "err", err)
+			continue
+		}
+		onDie(event.Actor.ID, event.Actor.Attributes[containerLabelSandboxID])
+	}
+	// Wait after draining, or the pipe closes under the scanner. A canceled ctx kills
+	// the process, so the error it reports then is the cancellation, not a failure.
+	waitErr := cmd.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		return fmt.Errorf("read docker events: %w", scanErr)
+	}
+	return fmt.Errorf("docker events exited: %s: %w", strings.TrimSpace(stderr.String()), waitErr)
 }
 
 func firstGateway(inspect *networkInspect) string {

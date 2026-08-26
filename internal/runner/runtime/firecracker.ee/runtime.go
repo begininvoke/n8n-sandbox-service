@@ -167,12 +167,21 @@ type sandboxState struct {
 	rootfsPath        string
 	snapshotMemPath   string
 	snapshotStatePath string
-	process           process
-	proxy             daemonProxy
-	running           bool
-	stopped           bool
-	transition        sandboxTransition
-	stoppedAt         time.Time
+
+	// bootParams is the sidecar of the golden snapshot this sandbox was created
+	// from, resolved once at reservation and never re-read. Recovery replays it, so
+	// re-resolving would boot a different guest than the one this sandbox is a
+	// descendant of: an operator who rebuilds or swaps the golden snapshot mid-life
+	// would otherwise have existing sandboxes cold-boot with another build's memory
+	// size, kernel and init= — against a rootfs that no longer matches.
+	bootParams *bootParams
+
+	process    process
+	proxy      daemonProxy
+	running    bool
+	stopped    bool
+	transition sandboxTransition
+	stoppedAt  time.Time
 
 	// generation counts the microVM incarnations this sandbox has had. It is
 	// bumped in teardownRunningVM, before the process is killed, and captured by
@@ -255,6 +264,8 @@ type dependencies struct {
 	pauseVM             func(ctx context.Context, socketPath string) error
 	createSnapshot      func(ctx context.Context, socketPath string) error
 	loadSnapshot        func(ctx context.Context, socketPath string, cfg Config) error
+	coldBoot            func(ctx context.Context, socketPath string, params *bootParams) error
+	loadBootParams      func(path string) (*bootParams, error)
 	newProxy            func(ctx context.Context, listenAddr string, netnsName string, guestAddr string) (daemonProxy, error)
 	probeDaemon         func(ctx context.Context, baseURL string) error
 	freeBytesInDir      func(path string) (int64, error)
@@ -270,6 +281,8 @@ func defaultDependencies(fc Config) dependencies {
 		pauseVM:             pauseVM,
 		createSnapshot:      createSnapshot,
 		loadSnapshot:        loadSnapshot,
+		coldBoot:            coldBoot,
+		loadBootParams:      loadBootParams,
 		newProxy: func(ctx context.Context, listenAddr string, netnsName string, guestAddr string) (daemonProxy, error) {
 			return startDaemonProxy(ctx, listenAddr, netnsName, guestAddr)
 		},
@@ -502,6 +515,20 @@ func (r *Runtime) Shutdown(ctx context.Context) {
 // out claimed for creation so a delete arriving mid-create waits for the microVM
 // to be published instead of tearing down around it.
 func (r *Runtime) reserveSandbox(sandboxID string) (*sandboxState, error) {
+	// Resolved here, at the one moment a sandbox is tied to a golden snapshot, and
+	// carried on the state from then on. Admission has already read and validated
+	// this file, so a failure here means it changed under a running runner — worth
+	// refusing the create over, since the sandbox would have nothing to recover
+	// from. Read before the lock: it is a file, and r.mu is the whole runtime's.
+	//
+	// This is also where a flavor resolver lands when there is more than one golden
+	// snapshot; nothing downstream needs to change for it, because boot parameters
+	// already travel per sandbox rather than per runner.
+	params, err := r.deps.loadBootParams(bootParamsPath(r.config))
+	if err != nil {
+		return nil, err
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -530,6 +557,7 @@ func (r *Runtime) reserveSandbox(sandboxID string) (*sandboxState, error) {
 		rootfsPath:        sandboxRootfsPath(r.runnerConfig.DataDir, sandboxID),
 		snapshotMemPath:   sandboxSnapshotMemPath(dataDir),
 		snapshotStatePath: sandboxSnapshotStatePath(dataDir),
+		bootParams:        params,
 		transition:        transitionCreating,
 		info: &runnerruntime.SandboxInfo{
 			ID:   sandboxID,
@@ -654,20 +682,34 @@ func (s *sandboxState) daemonURLAddr() string {
 
 // prepareJail creates the jail root and bind-mounts snapshot assets at the
 // paths expected by the restored Firecracker snapshot.
+//
+// The kernel goes in unconditionally, even though only a cold boot reads it: one
+// jail prep then serves both paths, and which one a sandbox takes is not known
+// until it is activated — a sandbox can be created from its snapshot and cold
+// booted later, on the same jail. It is mounted at the jail path its own sidecar
+// records, since that is the path the cold boot asks Firecracker to load, and is
+// left with the template's own ownership and mode: Firecracker only reads it, and
+// a bind mount shares the inode, so chowning it would rewrite an asset every other
+// sandbox on the host shares.
 func (r *Runtime) prepareJail(ctx context.Context, state *sandboxState) error {
 	jailRoot := filepath.Join(r.config.JailerBaseDir, "firecracker", state.vmID, "root")
 	rootfsTarget := filepath.Join(jailRoot, strings.TrimPrefix(r.config.SnapshotVirtioBlockPath, "/"))
+	kernelTarget := filepath.Join(jailRoot, strings.TrimPrefix(state.bootParams.KernelImagePath, "/"))
 	script := fmt.Sprintf(`
 set -eu
 mkdir -p %[1]s
 mkdir -p %[5]s
-touch %[1]s/snapshot_mem %[1]s/snapshot_state %[6]s
+mkdir -p %[8]s
+touch %[1]s/snapshot_mem %[1]s/snapshot_state %[6]s %[9]s
 mount --bind %[2]s %[1]s/snapshot_mem
 mount --bind %[3]s %[1]s/snapshot_state
 mount --bind %[4]s %[6]s
+mount --bind %[7]s %[9]s
 chown 1000:1000 %[1]s/snapshot_mem %[1]s/snapshot_state %[6]s
 chmod 0664 %[1]s/snapshot_mem %[1]s/snapshot_state %[6]s
-`, shellquote.Quote(jailRoot), shellquote.Quote(state.snapshotMemPath), shellquote.Quote(state.snapshotStatePath), shellquote.Quote(state.rootfsPath), shellquote.Quote(filepath.Dir(rootfsTarget)), shellquote.Quote(rootfsTarget))
+`, shellquote.Quote(jailRoot), shellquote.Quote(state.snapshotMemPath), shellquote.Quote(state.snapshotStatePath),
+		shellquote.Quote(state.rootfsPath), shellquote.Quote(filepath.Dir(rootfsTarget)), shellquote.Quote(rootfsTarget),
+		shellquote.Quote(filepath.Join(r.config.TemplateDir, "vmlinux")), shellquote.Quote(filepath.Dir(kernelTarget)), shellquote.Quote(kernelTarget))
 	return r.deps.run(ctx, "sudo", "/bin/sh", "-c", script)
 }
 

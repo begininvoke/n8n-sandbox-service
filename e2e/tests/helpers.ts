@@ -318,7 +318,12 @@ export async function apiRequest(
   method: string,
   path: string,
   opts?: { data?: unknown; rawHeaders?: Record<string, string> },
-): Promise<{ status: number; body: string; json: () => Promise<unknown> }> {
+): Promise<{
+  status: number;
+  body: string;
+  headers: Record<string, string>;
+  json: () => Promise<unknown>;
+}> {
   const h = opts?.rawHeaders ?? (await headers({ 'Content-Type': 'application/json' }));
   const resp = await request.fetch(path, {
     method,
@@ -329,6 +334,8 @@ export async function apiRequest(
   return {
     status: resp.status(),
     body,
+    // Playwright lowercases response header names.
+    headers: resp.headers(),
     json: () => Promise.resolve(JSON.parse(body)),
   };
 }

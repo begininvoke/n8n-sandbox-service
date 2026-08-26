@@ -73,6 +73,10 @@ func (f *fakeDockerBackend) pullImage(context.Context, string) error {
 	return errors.New("unexpected pullImage")
 }
 
+func (f *fakeDockerBackend) watchContainerDeaths(context.Context, func(string, string)) error {
+	return errors.New("unexpected watchContainerDeaths")
+}
+
 func (f *fakeDockerBackend) run(context.Context, ...string) (string, error) {
 	return "", errors.New("unexpected run")
 }
@@ -333,7 +337,7 @@ func TestEnsureSandboxRunningCleansUpStartedContainerOnWakeFailures(t *testing.T
 				return nil
 			}
 
-			err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id")
+			_, err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id")
 			if err == nil {
 				t.Fatal("expected wake to fail")
 			}
@@ -371,7 +375,7 @@ func TestEnsureSandboxRunningFailedWakeAfterNetworkDetachStopsContainerAndRemove
 		return fmt.Errorf("unexpected waitForDaemon")
 	}
 
-	err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id")
+	_, err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id")
 	if !errors.Is(err, ErrSandboxNetworkUnavailable) {
 		t.Fatalf("ensureSandboxRunningOnce() error = %v, want %v", err, ErrSandboxNetworkUnavailable)
 	}
@@ -395,7 +399,7 @@ func TestEnsureSandboxRunningLeavesRulesWhenWakeCleanupCannotStopContainer(t *te
 		return nil
 	}
 
-	err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id")
+	_, err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id")
 	if err == nil {
 		t.Fatal("expected wake to fail")
 	}
@@ -425,7 +429,7 @@ func TestEnsureSandboxRunningDoesNotCleanUpAfterSuccessfulWake(t *testing.T) {
 		return nil
 	}
 
-	if err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id"); err != nil {
+	if _, err := m.ensureSandboxRunningOnce(context.Background(), "sandbox-id"); err != nil {
 		t.Fatalf("ensureSandboxRunningOnce() failed: %v", err)
 	}
 	wantEvents := []string{"find", "inspect", "start", "containerIP", "applyPolicy", "waitForDaemon"}
