@@ -49,7 +49,9 @@ func testRunnerConfig(capacity int32) *config.Config {
 
 func stubCreateDeps(rt *Runtime) {
 	rt.deps.run = func(context.Context, string, ...string) error { return nil }
-	rt.deps.start = func(context.Context, string, ...string) (process, error) { return &fakeProcess{}, nil }
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) {
+		return &fakeProcess{}, nil
+	}
 	rt.deps.pathExists = func(string) bool { return true }
 	rt.deps.cloneRootfs = func(context.Context, string, string) error { return nil }
 	rt.deps.cloneGoldenSnapshot = func(_ context.Context, _, _, dataDir string) error {
@@ -163,7 +165,7 @@ func TestRuntimeCreateSandboxStartsFirecrackerAndProxy(t *testing.T) {
 		commands = append(commands, recordedCommand{name: name, args: args})
 		return nil
 	}
-	rt.deps.start = func(_ context.Context, name string, args ...string) (process, error) {
+	rt.deps.start = func(_ context.Context, _ func(error), name string, args ...string) (process, error) {
 		started = append(started, recordedCommand{name: name, args: args})
 		return proc, nil
 	}
@@ -294,7 +296,7 @@ func TestRuntimeDeleteHoldsSlotUntilCleanupCompletes(t *testing.T) {
 		}
 		return nil
 	}
-	rt.deps.start = func(context.Context, string, ...string) (process, error) { return proc, nil }
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) { return proc, nil }
 	rt.deps.pathExists = func(string) bool { return true }
 	rt.deps.cloneRootfs = func(context.Context, string, string) error { return nil }
 	rt.deps.cloneGoldenSnapshot = func(context.Context, string, string, string) error { return nil }
@@ -342,7 +344,7 @@ func TestRuntimeDeleteSandboxWaitsForCreate(t *testing.T) {
 
 	proc := &fakeProcess{}
 	proxy := &fakeProxy{}
-	rt.deps.start = func(context.Context, string, ...string) (process, error) { return proc, nil }
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) { return proc, nil }
 	rt.deps.newProxy = func(context.Context, string, string, string) (daemonProxy, error) { return proxy, nil }
 
 	createReachedSnapshot := make(chan struct{})
@@ -442,7 +444,7 @@ func TestRuntimeCreateSandboxCleansUpOnFailure(t *testing.T) {
 		runCount++
 		return nil
 	}
-	rt.deps.start = func(context.Context, string, ...string) (process, error) { return proc, nil }
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) { return proc, nil }
 	rt.deps.pathExists = func(string) bool { return true }
 	rt.deps.cloneRootfs = func(context.Context, string, string) error { return nil }
 	rt.deps.cloneGoldenSnapshot = func(context.Context, string, string, string) error { return nil }
@@ -475,6 +477,107 @@ func TestRuntimeCreateSandboxCleansUpOnFailure(t *testing.T) {
 	}
 }
 
+// A failed delete normally keeps its slot so a delete retry can reclaim it, but a
+// failed create is the one caller with no retry behind it: it returns an error, so
+// the API stores no record and nothing can name the sandbox again. Its slot has to
+// come back here or it is stranded until the runner restarts.
+func TestRuntimeCreateSandboxReleasesSlotWhenCleanupFails(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	// cleanupHost is the only script that removes the jail directory, so a busy
+	// mount under it fails the create's cleanup and nothing else.
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		if len(args) > 0 && strings.Contains(args[len(args)-1], "rm -rf") {
+			return errors.New("rm: cannot remove jail dir: Device or resource busy")
+		}
+		return nil
+	}
+	rt.deps.probeDaemon = func(context.Context, string) error { return errors.New("daemon down") }
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err == nil {
+		t.Fatal("expected CreateSandbox() failure")
+	}
+
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 0 {
+		t.Fatalf("Capacity().Used = %d, want the slot back even though cleanup failed", capacity.Used)
+	}
+	if _, err := rt.GetSandboxInfo(context.Background(), sandboxID); !errors.Is(err, runnerruntime.ErrSandboxNotFound) {
+		t.Fatalf("GetSandboxInfo() error = %v, want ErrSandboxNotFound", err)
+	}
+	// The id has to be free too, or a retry of the same create is refused forever.
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err == nil {
+		t.Fatal("expected CreateSandbox() failure")
+	} else if strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("CreateSandbox() error = %v, want the id to be reusable", err)
+	}
+}
+
+// A stop whose host cleanup failed still marks the sandbox stopped and drops its
+// process and proxy handles. The delete that follows has to clean up regardless, or
+// the jail's bind mounts go on pinning the snapshot files the delete removes, with
+// nothing left able to free them.
+func TestRuntimeDeleteRunsHostCleanupForAStoppedSandbox(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if err := rt.StopSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("StopSandbox() failed: %v", err)
+	}
+
+	unmounts := 0
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		if len(args) > 0 && strings.Contains(args[len(args)-1], "umount") {
+			unmounts++
+		}
+		return nil
+	}
+	if err := rt.DeleteSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if unmounts == 0 {
+		t.Error("delete skipped host cleanup, so the jail mounts still pin the deleted snapshot files")
+	}
+}
+
+// Once a process has been reaped its pid is the kernel's to reuse, and signalling a
+// whole process group by a recycled id would kill unrelated processes. A live group
+// stands in for that here: if Kill signalled despite the reap, it would die.
+func TestProcessGroupKillSkipsAReapedPid(t *testing.T) {
+	exited := make(chan struct{})
+	proc, err := startCommand(context.Background(), func(error) { close(exited) }, "sh", "-c", "sleep 30")
+	if err != nil {
+		t.Fatalf("startCommand() failed: %v", err)
+	}
+	group, ok := proc.(*processGroup)
+	if !ok {
+		t.Fatalf("startCommand() returned %T, want *processGroup", proc)
+	}
+	t.Cleanup(func() {
+		group.reaped.Store(false)
+		_ = group.Kill()
+	})
+
+	group.reaped.Store(true)
+	if err := group.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("Kill() = %v, want os.ErrProcessDone", err)
+	}
+	select {
+	case <-exited:
+		t.Error("Kill signalled a process group it had already recorded as reaped")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
 func TestProbeDaemonRejectsUnhealthyStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.NotFound(w, nil)
@@ -489,7 +592,7 @@ func TestProbeDaemonRejectsUnhealthyStatus(t *testing.T) {
 }
 
 func TestStartCommandRunsInOwnProcessGroup(t *testing.T) {
-	proc, err := startCommand(context.Background(), "sh", "-c", "sleep 10")
+	proc, err := startCommand(context.Background(), nil, "sh", "-c", "sleep 10")
 	if err != nil {
 		t.Fatalf("startCommand() failed: %v", err)
 	}

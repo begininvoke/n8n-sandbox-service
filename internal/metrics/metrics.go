@@ -190,6 +190,7 @@ type RunnerRecorder struct {
 	containerOps        *prometheus.CounterVec
 	containerOpDuration *prometheus.HistogramVec
 	lifecycleSteps      *prometheus.HistogramVec
+	guestDeaths         prometheus.Counter
 }
 
 // NewRunnerRecorder builds the runner recorder. If enabled is false, the
@@ -229,7 +230,15 @@ func NewRunnerRecorder(enabled bool) *RunnerRecorder {
 		},
 		[]string{"operation", "step"},
 	)
-	reg.MustRegister(containerOps, containerOpDuration, lifecycleSteps)
+	guestDeaths := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "guest_deaths_total",
+			Help:        "Sandbox guests that died without the runner stopping them.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+	)
+	reg.MustRegister(containerOps, containerOpDuration, lifecycleSteps, guestDeaths)
 	return &RunnerRecorder{
 		reg:                 reg,
 		httpRequests:        httpReq,
@@ -237,6 +246,7 @@ func NewRunnerRecorder(enabled bool) *RunnerRecorder {
 		containerOps:        containerOps,
 		containerOpDuration: containerOpDuration,
 		lifecycleSteps:      lifecycleSteps,
+		guestDeaths:         guestDeaths,
 	}
 }
 
@@ -273,6 +283,17 @@ func (r *RunnerRecorder) ObserveLifecycleStep(operation, step string, dur time.D
 		return
 	}
 	r.lifecycleSteps.WithLabelValues(operation, step).Observe(dur.Seconds())
+}
+
+// ObserveGuestDeath records a sandbox guest that exited without the runner
+// stopping it. Unlabeled: a death has no outcome of its own, and a runner
+// process serves exactly one runtime, so which backend detected it is a property
+// of the scrape target rather than of the series.
+func (r *RunnerRecorder) ObserveGuestDeath() {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.guestDeaths.Inc()
 }
 
 // SetActiveContainers registers a scrape-time gauge that calls f to read the
@@ -315,6 +336,15 @@ func (r *RunnerRecorder) ContainerOpCount(operation string, success bool) float6
 		return 0
 	}
 	return testutil.ToFloat64(r.containerOps.WithLabelValues(operation, resultLabel(success)))
+}
+
+// GuestDeathCount returns the counter value for guest deaths.
+// Intended for tests in other packages.
+func (r *RunnerRecorder) GuestDeathCount() float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.guestDeaths)
 }
 
 func resultLabel(success bool) string {

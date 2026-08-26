@@ -67,6 +67,59 @@ part of the public API, and not a promise that the same sandbox ID will always
 get the same slot after restart. A sandbox that stops releases its slot and may
 wake onto a different one.
 
+A stop releases its slot even when the host cleanup that follows fails. The
+failure is logged and returned, but the state moves on to stopped, because that is
+the only outcome that leaves the sandbox usable. `teardownRunningVM` drops the
+process and proxy handles whatever it returns, so no retry can resume where it
+stopped — and a sandbox left marked running would hold its slot for a microVM
+nothing can reach, hand out a daemon URL nothing listens on, and fail every later
+stop against an API socket that died with its guest. Nothing would ever reclaim it.
+The snapshot is written by then, so the sandbox becomes an ordinary stopped one and
+wakes on the next request instead; a slot handed back with leftovers on it comes up
+clean anyway, because the next sandbox clears the slot before building it.
+
+That last part is load-bearing for every path that releases a slot after a failed
+teardown, so it is worth being precise about which resources are per-slot. The netns
+`fc-sb-{slot}` and the host veth `fc-veth-{slot}` are, and the setup script deletes
+both before creating them — including the veth, without which a single leftover
+would fail `ip link add` under `set -eu` and strand the slot until the runner
+restarts. Deleting a netns by name works even while a stale microVM still runs
+inside it: the kernel keeps that namespace alive for the process while freeing the
+name, so the new sandbox gets an empty namespace and the stale guest is isolated in
+an unnamed one with its uplink gone. The proxy port is per-slot too, and is freed by
+the `Stop` that teardown performs on every handle it claims; were it ever left
+bound, the next create on the slot would fail loudly on bind rather than share it.
+The jail directory is keyed to the `vmID`, so it collides with nothing and startup
+reconcile sweeps it.
+
+A failed **delete** keeps its slot, which looks inconsistent with that but is not.
+Cleanup runs as a single shell command, so a failure that is not the jail directory
+it removes last — an expired context, a `sudo` that never ran — leaves it unknown
+whether the netns is really gone. Delete can afford that caution where stop cannot,
+because a delete retry does arrive: the API keeps the sandbox row when the runner
+reports a delete failure, and the idle sweeper retries every sweep interval. The
+retry repeats host cleanup, removes the data directory, and releases the slot.
+
+Host cleanup on delete runs whether or not the sandbox still has process and proxy
+handles, which matters because a stop or crash whose cleanup failed marks the sandbox
+stopped and drops those handles anyway. Skipping cleanup on the strength of them
+would leave the jail's bind mounts in place while the delete removes the data
+directory beneath them, so the snapshot files would stay allocated with no way left
+to reclaim them: startup reconcile cannot help either, since its `rm -rf` fails on a
+directory holding an active mount. Repeating cleanup is safe because every step is
+guarded and what it removes is keyed to the `vmID`.
+
+The admission canary is built on this — a canary whose
+cleanup fails keeps its slot and fails admission, so a capacity-1 runner is never
+marked healthy while one of its slots is unaccounted for.
+
+The cleanup a **failed create** runs is the exception to that: it releases the slot,
+because it is the one delete with nothing behind it. The create returns an error, so
+the API stores no record for the sandbox, and without a record neither an explicit
+delete nor the idle sweeper can ever name it again. Keeping the slot would strand
+runner capacity until the process restarts, so this path follows stop rather than
+delete and hands it back.
+
 Because slot ownership moves like that, create, stop, wake, and delete are
 mutually exclusive per sandbox: each claims the sandbox for the duration of the
 transition and the others wait. Without that, a delete overlapping a create or
@@ -75,9 +128,32 @@ skip teardown, and leave an orphaned microVM holding host resources on a slot th
 runner had already handed back. The delete claim is terminal and doubles as the
 tombstone that hides the sandbox from lookups, so a single flag decides both
 mutual exclusion and visibility. `Shutdown` is the one exception to waiting — it
-sweeps sandboxes mid-stop or mid-wake, since the process is exiting and startup
-reconcile removes whatever leaks, but it still skips sandboxes a delete already
-claimed so teardown never runs twice.
+sweeps sandboxes mid-stop, mid-wake or mid-guest-death, since a claim it waited for
+could outlive the process and leave a microVM running past the runner (jailer's
+children are their own process group, so they do not die with it). It still skips
+sandboxes a delete already claimed, so a delete never runs twice.
+
+Because of that exception, the claim cannot be the only thing protecting a
+sandbox's `process` and `proxy` handles: `Shutdown` can be tearing down the same
+microVM as the claim holder. So `teardownRunningVM` takes both handles off the
+state in the same critical section that bumps the generation, and every other
+read and write of them holds `r.mu` too. Whoever takes the handles owns the stop
+and the kill, and the loser finds nil and repeats only `cleanupHost`, which is
+written to be repeatable.
+
+An activation is the other side of that: `Shutdown` decides whether to kill a
+microVM by reading handles a create or wake has not published yet, so it can find
+nothing to tear down, delete the sandbox and hand the slot back while the guest is
+still coming up. `activateSandboxVM` therefore rechecks after publishing each
+handle whether the sandbox is still its own, and fails with `errActivationAbandoned`
+if not. The recheck comes *after* the publication on purpose: the caller's rollback
+is what kills the microVM, and a rollback only tears down handles it can see.
+Carrying on instead would finish building a guest nothing tracks, holding the netns
+and jail mounts of a slot already handed to someone else — and outliving the runner,
+since jailer's children are their own process group. Today a stale `loadSnapshot`
+usually fails that activation anyway, because `Shutdown` deletes the data directory
+out from under it, but cold-boot recovery boots the rootfs and reads no snapshot
+files, so that accident stops covering it.
 
 A claim comes with a budget: `beginTransition` returns the context its operation
 must run under, which is the caller's detached from cancellation and capped at two
@@ -193,6 +269,73 @@ rebuilds the whole set when `SANDBOX_RUNNER_FIRECRACKER_CREATE_SNAPSHOT_SCRIPT`
 is set, and otherwise fails naming the script to re-run. Bump `schema_version`
 when the layout changes; the runner rejects versions it does not know rather
 than guessing.
+
+A set that is already complete is verified rather than trusted, because the
+sidecar only certifies the snapshot the runner actually restores if the configured
+paths lead to it. Regeneration replaces `snapshot_mem` and `snapshot_state` inside
+the `--out` directory, so a configured path that is an independent copy or a
+symlink out of it keeps serving the previous snapshot under a `boot.json`
+describing the new one, and survives every restart in that state. So whenever the
+runner owns snapshot creation and its outputs are present, admission resolves both
+configured paths and fails if either does not land on the generated file. Hosts
+without a create script, or whose `--out` directory holds no generated files, have
+nothing to compare against and are left alone.
+
+## Guest death
+
+A microVM can die on its own: the guest daemon runs as PID 1 with `panic=1
+reboot=k` in the boot args, so killing it panics the kernel, which resets the CPU
+and exits the VMM. A host `SIGKILL` of the VMM and a `reboot` from inside the
+guest end the same way. Because jailer execs Firecracker in place, the process
+the runner starts lives exactly as long as the guest, so waiting on it is the
+detection: `startCommand` reports the exit and `handleGuestDeath` reacts.
+
+Telling that apart from the runner's own kills is what `sandboxState.generation`
+is for. `teardownRunningVM` bumps it before killing the process, and each exit
+callback carries the generation of the microVM it was registered for, so a stop,
+delete, wake rollback or shutdown is not read as a crash — and an old
+incarnation's exit arriving late cannot mark a freshly woken one dead. The death
+is recorded straight away, before the handler queues for the sandbox's transition
+claim: an exit that arrives while another operation holds the sandbox is only
+looked at once that operation has released it, by which point its teardown has
+bumped the generation past the one the exit carries. A wake that fails *because*
+its guest just died goes exactly that way. The teardown that follows is still
+gated on the generation, so it cannot run twice on the same microVM.
+
+A dead guest is torn down immediately and **hands its slot back**, which is what
+bounds the damage: a crashed sandbox costs disk and nothing else, so a client
+retrying cannot accumulate slots. What is left behind is what an idle stop leaves
+behind, minus a usable snapshot — stopped, no slot, files intact — so the
+existing paths need no special case: `StopSandbox` is idempotent instead of
+looping on a dead API socket, the idle sweeper can delete it, and `DaemonURL`
+reports it not running.
+
+It is **not** restored from its snapshot afterwards. The guest kept writing to
+the rootfs after that snapshot was taken, and restoring a memory image whose
+cached filesystem metadata no longer matches the disk corrupts it silently —
+nothing detects the mismatch. So `EnsureSandboxRunning` refuses a pinned
+(`mustColdBoot`) sandbox. Bringing it back needs a boot of its existing rootfs,
+which this runtime does not do yet; until then a request for a crashed sandbox
+fails and the sandbox stays deletable.
+
+The pin is set by the restore, not by the death, and specifically *before* the
+restore is asked for rather than after it reports success. `snapshot/load` carries
+`resume_vm: true`, so one request both loads the snapshot and lets the guest start
+writing to a rootfs that snapshot no longer describes. Its failures are therefore
+ambiguous — a deadline that expires while the response is read leaves no way to know
+whether the guest ran — and the ambiguous case is resolved as if it did. Only the
+snapshot `StopSandbox` takes of the paused guest clears the pin.
+
+Tying it to the restore is what makes it hold for a guest that dies mid-wake, where
+the death cannot be told apart from the rollback's own kill, and for a wake that
+failed after the restore for a reason of its own: that guest ran too, so its snapshot
+is just as stale. The cost of pinning first is that a load which failed without
+resuming anything is pinned as well, which costs a cold boot instead of a restore.
+Placing the pin immediately before the request rather than earlier is what keeps that
+cost small — every step ahead of it fails unambiguously with no guest having run, so
+those failures leave the sandbox wakeable. Until cold boot exists a pinned sandbox is
+refused, which is the deliberate trade: a loud failure instead of a silently
+corrupted disk.
 
 ## Current Limitations
 
