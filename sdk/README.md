@@ -177,7 +177,7 @@ try {
 
 It is never retried automatically, by design: an invisible retry would hand back a working sandbox and hide the loss. Two consequences to plan for — a completed execution is no longer readable (`getExecution` returns 404), and a caller-supplied `execId` is no longer idempotent, so re-posting one that ran before the restart runs the command again.
 
-A crash is not the only way memory goes, so do not treat this error as the only signal for it. A sandbox left idle long enough is stopped by the service, and depending on the deployment's runtime, waking it can cost the same three things — with no `SandboxRestartedError`, because an idle stop is reported through `status` instead: `getSandbox` returns `stopped` for it, while a crash leaves `running`. Code that must know its background processes are alive should check `status` before relying on them rather than waiting to be told.
+A crash is not the only way memory goes, so do not treat this error as the only signal for it. A sandbox left idle long enough is stopped by the service, and depending on the deployment's runtime, waking it can cost the same three things — with no `SandboxRestartedError`, because an idle stop is reported through `status` instead: `getSandbox` returns `stopped` for it, while a crash leaves `running`. So checking `status` before relying on background processes is what catches the idle stop in advance. A crash cannot be caught that way — `status` stays `running` right through it — and the `SandboxRestartedError` above is its only notice.
 
 ## Development
 

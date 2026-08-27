@@ -65,7 +65,8 @@ type Runtime struct {
 	// containers the runner is stopping on purpose, and which sandboxes Docker
 	// restarted under it. Everything else about a sandbox is read back from Docker.
 	mu            sync.Mutex
-	expectedStops map[string]time.Time
+	expectedStops map[string]expectedStop
+	stopToken     uint64
 	restarted     map[string]struct{}
 }
 
@@ -116,7 +117,7 @@ func newRuntime(runnerConfig *config.Config, cfg Config, docker dockerBackend) *
 		waitForDaemon: waitForDaemon,
 		imageReadyCh:  make(chan struct{}),
 		watchBackoff:  2 * time.Second,
-		expectedStops: make(map[string]time.Time),
+		expectedStops: make(map[string]expectedStop),
 		restarted:     make(map[string]struct{}),
 	}
 }
@@ -393,7 +394,7 @@ func (m *Runtime) ensureSandboxRunningOnce(ctx context.Context, sandboxID string
 		// restart — and the container it leaves behind is the one this line is about to
 		// start. Dropped before the start, not after, because the new process can die
 		// first.
-		m.forgetExpectedStop(containerID)
+		m.discardUnclaimedStop(containerID)
 		if err := m.docker.startContainer(ctx, containerID); err != nil {
 			return recovering, fmt.Errorf("start container: %w", err)
 		}
@@ -455,9 +456,9 @@ func (m *Runtime) awaitContainerRestart(ctx context.Context, containerID string)
 func (m *Runtime) cleanupWakeFailure(containerID string) {
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	m.expectStop(containerID)
+	token := m.expectStop(containerID)
 	if err := m.docker.stopContainer(cleanupCtx, containerID); err != nil {
-		m.forgetExpectedStop(containerID)
+		m.forgetExpectedStop(containerID, token)
 		slog.Warn("stop container after wake failure", "container_id", containerID, "err", err)
 		return
 	}
@@ -484,9 +485,9 @@ func (m *Runtime) StopSandboxContainer(ctx context.Context, sandboxID string) er
 	if !inspect.State.Running {
 		return nil
 	}
-	m.expectStop(containerID)
+	token := m.expectStop(containerID)
 	if err := m.docker.stopContainer(ctx, containerID); err != nil {
-		m.forgetExpectedStop(containerID)
+		m.forgetExpectedStop(containerID, token)
 		return err
 	}
 	return nil
@@ -547,9 +548,9 @@ func (m *Runtime) removeContainerAndTeardownRules(ctx context.Context, container
 		return nil
 	}
 	// Removing a running container kills it, and that death is the runner's doing.
-	m.expectStop(containerID)
+	token := m.expectStop(containerID)
 	if err := m.docker.removeContainer(ctx, containerID); err != nil {
-		m.forgetExpectedStop(containerID)
+		m.forgetExpectedStop(containerID, token)
 		slog.Warn("remove sandbox container", "container_id", containerID, "err", err)
 		return err
 	}

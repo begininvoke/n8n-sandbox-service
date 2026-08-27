@@ -213,17 +213,31 @@ export async function execWithTransientRetry(
  * it. The stream is abandoned instead of read for the same reason.
  */
 export async function crashGuest(id: string): Promise<void> {
+  // Resolved outside the try: minting the tenant key is not the request whose
+  // failure a crash is allowed to look like.
+  const requestHeaders = await headers({ 'Content-Type': 'application/json' });
+
+  let res: Response;
   try {
-    const res = await fetch(`${BASE_URL}/sandboxes/${id}/executions`, {
+    res = await fetch(`${BASE_URL}/sandboxes/${id}/executions`, {
       method: 'POST',
-      headers: await headers({ 'Content-Type': 'application/json' }),
+      headers: requestHeaders,
       body: JSON.stringify({ command: 'kill -TERM 1' }),
     });
-    await res.body?.cancel();
   } catch {
     // Shutdown is graceful, so this call normally returns before the guest goes
     // down — but a dropped connection is the requested outcome, not a failure.
+    return;
   }
+
+  // The daemon writes the 200 and flushes it before it runs the command, so a
+  // delivered kill always carries one. Any other status is a request that never
+  // reached the guest, and a caller that went on would wait out its crash timeout
+  // on a sandbox that is still alive.
+  if (!res.ok) {
+    throw new Error(`crash guest ${id} failed: ${res.status} ${await res.text()}`);
+  }
+  await res.body?.cancel();
 }
 
 /**

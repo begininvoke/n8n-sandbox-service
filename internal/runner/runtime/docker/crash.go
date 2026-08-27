@@ -70,6 +70,15 @@ func (m *Runtime) handleContainerDeath(containerID, sandboxID string) {
 // wait for this bound; see forgetExpectedStop.
 const expectedStopTTL = 2 * time.Minute
 
+// expectedStop is one recorded stop. The token names the call that recorded it,
+// which is what lets a call that failed take back its own mark and nothing else:
+// only one mark exists per container, so a second lifecycle call on the same
+// container overwrites the first, and this runtime serializes none of them.
+type expectedStop struct {
+	token uint64
+	at    time.Time
+}
+
 // expectStop records that the runner is about to stop or remove a container, so the
 // die event that follows is not read as a crash. Keyed by container rather than
 // sandbox because that is what every caller has, and what the event names.
@@ -79,21 +88,27 @@ const expectedStopTTL = 2 * time.Minute
 //
 // Recorded before the call it excuses, not after, because the event races the call's
 // return and usually wins.
-func (m *Runtime) expectStop(containerID string) {
+//
+// The returned token is what the caller passes to forgetExpectedStop if its call
+// fails. Tokens start at 1, so the zero token a skipped record returns matches
+// nothing.
+func (m *Runtime) expectStop(containerID string) uint64 {
 	if containerID == "" {
-		return
+		return 0
 	}
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Swept here because it is the only place the map grows, and it holds at most the
 	// stops of the last two minutes.
-	for id, at := range m.expectedStops {
-		if now.Sub(at) > expectedStopTTL {
+	for id, stop := range m.expectedStops {
+		if now.Sub(stop.at) > expectedStopTTL {
 			delete(m.expectedStops, id)
 		}
 	}
-	m.expectedStops[containerID] = now
+	m.stopToken++
+	m.expectedStops[containerID] = expectedStop{token: m.stopToken, at: now}
+	return m.stopToken
 }
 
 // forgetExpectedStop drops the mark for a stop that reported failure. Without this
@@ -106,7 +121,25 @@ func (m *Runtime) expectStop(containerID string) {
 // crash instead. That is the right way round: a spurious restart report costs the
 // client a retry, and on this runtime it is not even spurious, since a stopped
 // container comes back from docker start without the memory it had.
-func (m *Runtime) forgetExpectedStop(containerID string) {
+//
+// The token is what holds this to the caller's own mark. Nothing here serializes a
+// stop against a delete or against the wake path's own cleanup — the gateway lock
+// that separates stop from delete is not held over the proxy path a wake comes from
+// — so another call can have recorded over this one's mark before it failed.
+// Dropping that one would leave a death the runner did ask for to be read as a
+// crash, and cost the client a 409 for a restart that never happened.
+func (m *Runtime) forgetExpectedStop(containerID string, token uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.expectedStops[containerID].token == token {
+		delete(m.expectedStops, containerID)
+	}
+}
+
+// discardUnclaimedStop drops a container's mark whoever recorded it. Only the wake
+// path calls it, and only where no mark can still be claimed by the stop it was
+// recorded for; see that call site for why that holds there and nowhere else.
+func (m *Runtime) discardUnclaimedStop(containerID string) {
 	m.mu.Lock()
 	delete(m.expectedStops, containerID)
 	m.mu.Unlock()
@@ -118,12 +151,12 @@ func (m *Runtime) forgetExpectedStop(containerID string) {
 func (m *Runtime) takeExpectedStop(containerID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	at, ok := m.expectedStops[containerID]
+	stop, ok := m.expectedStops[containerID]
 	if !ok {
 		return false
 	}
 	delete(m.expectedStops, containerID)
-	return time.Since(at) <= expectedStopTTL
+	return time.Since(stop.at) <= expectedStopTTL
 }
 
 // wasRestarted reports whether a sandbox's container died and Docker brought it

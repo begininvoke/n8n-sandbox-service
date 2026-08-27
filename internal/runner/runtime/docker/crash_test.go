@@ -254,9 +254,9 @@ func TestAStopThatNeverDiedDoesNotMaskALaterCrash(t *testing.T) {
 	// A stop whose death never arrives — a container that was already exited when it
 	// was removed — leaves a mark behind, and Docker reuses nothing but the runner
 	// would keep it forever. Aged past its TTL it stops excusing deaths.
-	m.expectStop(crashContainerID)
+	token := m.expectStop(crashContainerID)
 	m.mu.Lock()
-	m.expectedStops[crashContainerID] = time.Now().Add(-2 * expectedStopTTL)
+	m.expectedStops[crashContainerID] = expectedStop{token: token, at: time.Now().Add(-2 * expectedStopTTL)}
 	m.mu.Unlock()
 
 	m.handleContainerDeath(crashContainerID, crashSandboxID)
@@ -396,6 +396,39 @@ func TestAStopDuringDockersRestartDoesNotExcuseALaterCrash(t *testing.T) {
 	}
 	if want := "172.18.0.9"; len(*policyIPs) == 0 || (*policyIPs)[len(*policyIPs)-1] != want {
 		t.Errorf("network policy applied for %v, want %v last: the rules have to follow the container's new address", *policyIPs, want)
+	}
+}
+
+// Nothing in this runtime serializes a stop against a delete or against the wake
+// path's own cleanup — the gateway lock that separates stop from delete is not held
+// over the proxy path a wake comes from — so two of them can be recording expected
+// stops for one container at once, and the second overwrites the one mark there is.
+// The call that fails has to take back only its own: dropping the other's leaves a
+// death the runner did ask for read as a crash, and the next request paying a 409
+// for a restart that never happened.
+func TestAFailedStopDoesNotTakeBackAConcurrentStopsMark(t *testing.T) {
+	backend := &crashBackend{states: []containerState{runningState()}, ip: "172.18.0.2"}
+	m, _ := newCrashRuntime(t, backend)
+	rec := metrics.NewRunnerRecorder(true)
+	m.SetMetricsRecorder(rec)
+
+	// One call records and is still in flight; a second records over it and its stop
+	// is the one that reaches Docker.
+	failing := m.expectStop(crashContainerID)
+	surviving := m.expectStop(crashContainerID)
+	if failing == surviving {
+		t.Fatal("expectStop handed both calls the same token, so a failed call cannot tell its own mark from another's")
+	}
+	m.forgetExpectedStop(crashContainerID, failing)
+
+	// The death the surviving stop asked for.
+	m.handleContainerDeath(crashContainerID, crashSandboxID)
+
+	if m.wasRestarted(crashSandboxID) {
+		t.Error("a death the runner asked for was recorded as a crash, so the next request is served a 409 for a restart that never happened")
+	}
+	if got := rec.GuestDeathCount(); got != 0 {
+		t.Errorf("guest death metric = %v, want 0: a stop the runner asked for is not a crash", got)
 	}
 }
 
