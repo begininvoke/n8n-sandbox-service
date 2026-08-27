@@ -379,6 +379,21 @@ sandbox on the host uses. `cleanupHost` unmounts it along with the rest, because
 `rm -rf` that ends cleanup cannot delete a directory holding an active mount: a kernel
 left mounted fails the whole teardown, and the sandbox goes on holding its slot.
 
+That mount is the one boot input the sidecar does not carry, because the sidecar
+records the jail path the kernel is mounted at rather than the host file mounted
+there, and `prepareJail` resolves that file from `TemplateDir` every time it builds a
+jail — the build that recovers a crashed sandbox included. So `reserveSandbox` also
+stats the template kernel and keeps its size and modification time on `sandboxState`,
+and `startGuest` re-stats before a cold boot and refuses one that no longer matches.
+The pairing it refuses is undetectable downstream: the guest either comes up or does
+not, and one that comes up far enough to answer the daemon probe is served to the
+client as recovered. Kernels are meant to reach a host by replacing the runner, so
+this guards an in-place template rebuild under a live one rather than recovering from
+it, and refusing costs only the recovery — the sandbox stays as the crash left it,
+stopped with its rootfs on disk. The check sits on the cold boot branch alone: a
+restore takes the kernel from its memory image and never opens the file, so a wake
+with a snapshot to return to is unaffected.
+
 A recovery is reported, an ordinary wake is not. `EnsureSandboxRunning` returns
 `WakeResult{Recovered}`, and the runner's proxy turns that into `409
 sandbox_restarted` for the request that drove it rather than proxying it — see

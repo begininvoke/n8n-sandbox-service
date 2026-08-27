@@ -370,6 +370,81 @@ func TestRecoveryReplaysTheBootParametersTheSandboxWasCreatedFrom(t *testing.T) 
 	}
 }
 
+// The sidecar pins the jail path the kernel is mounted at, not the file mounted
+// there, and prepareJail resolves that file from the template every time it builds a
+// jail. So a template rebuilt under a running runner reaches recovery even though
+// the sidecar did not: the cold boot would pair the new kernel with the rootfs and
+// boot arguments of the build the sandbox belongs to, and a guest that came up far
+// enough to answer the daemon probe would be served as recovered.
+func TestRecoveryRefusesAColdBootOnARebuiltTemplateKernel(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	exits := &guestExitStub{}
+	exits.install(rt, &fakeProcess{})
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	exits.fire(t, 0)
+
+	// The template is rebuilt while the sandbox is crashed, which installs a fresh
+	// file at the path every jail binds.
+	rebuilt := kernelPin{size: testKernelPin.size + 4096, modTime: testKernelPin.modTime.Add(time.Hour)}
+	rt.deps.statTemplateKernel = func(string) (kernelPin, error) { return rebuilt, nil }
+
+	coldBoots := 0
+	rt.deps.coldBoot = func(context.Context, string, *bootParams) error {
+		coldBoots++
+		return nil
+	}
+
+	_, err := rt.EnsureSandboxRunning(context.Background(), sandboxID)
+	if err == nil {
+		t.Fatal("recovery cold booted a sandbox on a kernel that replaced the one it was created against")
+	}
+	if !strings.Contains(err.Error(), "template kernel") {
+		t.Errorf("wake error = %v, want one naming the template kernel so an operator can see what changed", err)
+	}
+	if coldBoots != 0 {
+		t.Errorf("cold boots = %d, want 0: the boot has to be refused before Firecracker is given the kernel", coldBoots)
+	}
+}
+
+// The kernel is checked where it is read. A restore boots the kernel out of its
+// memory image without opening the file at all, so refusing a wake that has a
+// snapshot to return to would cost availability for a mismatch that cannot reach it.
+func TestWakeFromASnapshotIgnoresARebuiltTemplateKernel(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	// A stop snapshots the paused guest, which is what leaves the sandbox restorable.
+	if err := rt.StopSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("StopSandbox() failed: %v", err)
+	}
+
+	rt.deps.statTemplateKernel = func(string) (kernelPin, error) {
+		return kernelPin{size: testKernelPin.size + 4096, modTime: testKernelPin.modTime.Add(time.Hour)}, nil
+	}
+
+	restores := 0
+	rt.deps.loadSnapshot = func(context.Context, string, Config) error {
+		restores++
+		return nil
+	}
+	if _, err := rt.EnsureSandboxRunning(context.Background(), sandboxID); err != nil {
+		t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+	}
+	if restores != 1 {
+		t.Errorf("snapshot restores = %d, want 1", restores)
+	}
+}
+
 // waitForColdBoot blocks until a cold boot has started, which is the point at which
 // the recovery is under way and its caller is parked inside it.
 func waitForColdBoot(t *testing.T, coldBoots *atomic.Int32) {

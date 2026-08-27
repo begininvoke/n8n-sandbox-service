@@ -16,8 +16,8 @@ export class SandboxServiceError extends Error {
 }
 
 /**
- * Error thrown when the sandbox had to be restarted while the request was in flight,
- * because its guest crashed.
+ * Error thrown when the sandbox's guest crashed while the request was in flight, and
+ * the service restarted it.
  *
  * The sandbox is running again by the time this is thrown, and its files are intact,
  * so retrying the request once is the right response. What did not survive is
@@ -26,16 +26,17 @@ export class SandboxServiceError extends Error {
  * - processes started by earlier executions are gone, and nothing restarts them;
  * - completed executions are no longer readable, so `getExecution` returns a
  *   not-found error even for a command that succeeded before the restart;
+ * - files writes that were not persisted to disk are lost;
  * - a client-supplied `execId` is no longer idempotent — re-posting one that ran
  *   before the restart runs the command again rather than replaying its result.
  *
  * This is deliberately not retried automatically: a silent retry would hide the loss,
  * which is the one thing this error exists to prevent.
  */
-export class SandboxRestartedError extends SandboxServiceError {
+export class SandboxCrashedError extends SandboxServiceError {
   constructor(message: string, code?: number) {
     super(message, 409, code);
-    this.name = "SandboxRestartedError";
+    this.name = "SandboxCrashedError";
   }
 }
 
@@ -77,14 +78,13 @@ export function createErrorFromResponse(
       : `Sandbox service request failed with status ${status}`;
   let code: number | undefined;
 
-  if (typeof data === "object" && data !== null && "error" in data) {
-    const payload = data as { error: string; code?: number };
-    message = payload.error;
-    code = payload.code;
+  if (isRecord(data) && typeof data.error === "string") {
+    message = data.error;
+    code = typeof data.code === "number" ? data.code : undefined;
   }
 
   if (isSandboxRestarted(status, data, headers)) {
-    return new SandboxRestartedError(message, code);
+    return new SandboxCrashedError(message, code);
   }
 
   return new SandboxServiceError(message, status, code);
@@ -99,18 +99,18 @@ function isSandboxRestarted(status: number, data: unknown, headers: unknown): bo
   if (status !== 409) return false;
   if (headerValue(headers, SANDBOX_RESTARTED_HEADER) === "1") return true;
 
-  return (
-    typeof data === "object" &&
-    data !== null &&
-    "reason" in data &&
-    (data as { reason?: unknown }).reason === SANDBOX_RESTARTED_REASON
-  );
+  return isRecord(data) && data.reason === SANDBOX_RESTARTED_REASON;
+}
+
+/** Narrows an unknown decoded body or header bag to something readable by key. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function headerValue(headers: unknown, name: string): string | undefined {
-  if (typeof headers !== "object" || headers === null) return undefined;
+  if (!isRecord(headers)) return undefined;
 
-  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() !== name) continue;
     if (typeof value === "string") return value;
     if (Array.isArray(value) && typeof value[0] === "string") return value[0];

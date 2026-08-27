@@ -180,6 +180,13 @@ type sandboxState struct {
 	// chose them, and a runner-side path could only agree by coincidence.
 	bootParams *bootParams
 
+	// kernel identifies the template kernel file this sandbox was reserved against,
+	// captured beside the sidecar and checked before a cold boot. It is what makes
+	// the pin above cover the kernel as well: the sidecar records the jail path the
+	// kernel is mounted at, and prepareJail resolves the host file for that path from
+	// current configuration every time it builds the jail.
+	kernel kernelPin
+
 	process    process
 	proxy      daemonProxy
 	running    bool
@@ -270,6 +277,7 @@ type dependencies struct {
 	loadSnapshot        func(ctx context.Context, socketPath string, cfg Config) error
 	coldBoot            func(ctx context.Context, socketPath string, params *bootParams) error
 	loadBootParams      func(path string) (*bootParams, error)
+	statTemplateKernel  func(path string) (kernelPin, error)
 	newProxy            func(ctx context.Context, listenAddr string, netnsName string, guestAddr string) (daemonProxy, error)
 	probeDaemon         func(ctx context.Context, baseURL string) error
 	freeBytesInDir      func(path string) (int64, error)
@@ -287,6 +295,7 @@ func defaultDependencies(fc Config) dependencies {
 		loadSnapshot:        loadSnapshot,
 		coldBoot:            coldBoot,
 		loadBootParams:      loadBootParams,
+		statTemplateKernel:  statTemplateKernel,
 		newProxy: func(ctx context.Context, listenAddr string, netnsName string, guestAddr string) (daemonProxy, error) {
 			return startDaemonProxy(ctx, listenAddr, netnsName, guestAddr)
 		},
@@ -533,6 +542,15 @@ func (r *Runtime) reserveSandbox(sandboxID string) (*sandboxState, error) {
 		return nil, err
 	}
 
+	// Read here for the same reason and at the same moment, because the sidecar only
+	// names the jail path this file is mounted at. Admission has already required it
+	// to exist, so a failure means the template moved under a running runner, which
+	// is worth refusing the create over on its own.
+	kernel, err := r.deps.statTemplateKernel(templateKernelPath(r.config))
+	if err != nil {
+		return nil, err
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -562,6 +580,7 @@ func (r *Runtime) reserveSandbox(sandboxID string) (*sandboxState, error) {
 		snapshotMemPath:   sandboxSnapshotMemPath(dataDir),
 		snapshotStatePath: sandboxSnapshotStatePath(dataDir),
 		bootParams:        params,
+		kernel:            kernel,
 		transition:        transitionCreating,
 		info: &runnerruntime.SandboxInfo{
 			ID:   sandboxID,

@@ -123,8 +123,15 @@ func newTestRuntime(capacity int32) *Runtime {
 		params := testBootParams(rt.config)
 		return &params, nil
 	}
+	// Environment for the same reason: every sandbox is also reserved against the
+	// template kernel it would cold boot from, and no test has one on disk.
+	rt.deps.statTemplateKernel = func(string) (kernelPin, error) { return testKernelPin, nil }
 	return rt
 }
+
+// testKernelPin is what the template kernel stats as under test, so a test that
+// rebuilds the template only has to return something other than this.
+var testKernelPin = kernelPin{size: 42 << 20, modTime: time.Unix(1700000000, 0)}
 
 func TestRuntimeReadyChecksFirecrackerAssets(t *testing.T) {
 	rt := testRuntime(1)

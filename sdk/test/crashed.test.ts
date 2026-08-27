@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SandboxRestartedError, SandboxServiceError } from "../src/errors.js";
+import { SandboxCrashedError, SandboxServiceError } from "../src/errors.js";
 import { HttpClient } from "../src/http.js";
 import { startTestServer } from "./helpers.js";
 
@@ -9,7 +9,7 @@ const RESTARTED_BODY = JSON.stringify({
 });
 
 describe("sandbox restarted after a guest crash", () => {
-  it("raises SandboxRestartedError from a JSON request", async () => {
+  it("raises SandboxCrashedError from a JSON request", async () => {
     const server = await startTestServer((_req, res) => {
       res.writeHead(409, { "Content-Type": "application/json", "X-Sandbox-Restarted": "1" });
       res.end(RESTARTED_BODY);
@@ -18,14 +18,14 @@ describe("sandbox restarted after a guest crash", () => {
     try {
       const client = new HttpClient(server.baseUrl);
       await expect(client.requestJson("GET", "/sandboxes/abc/files")).rejects.toBeInstanceOf(
-        SandboxRestartedError,
+        SandboxCrashedError,
       );
     } finally {
       await server.close();
     }
   });
 
-  it("raises SandboxRestartedError from a stream request, which is where an exec starts", async () => {
+  it("raises SandboxCrashedError from a stream request, which is where an exec starts", async () => {
     const server = await startTestServer((_req, res) => {
       res.writeHead(409, { "Content-Type": "application/json", "X-Sandbox-Restarted": "1" });
       res.end(RESTARTED_BODY);
@@ -35,7 +35,7 @@ describe("sandbox restarted after a guest crash", () => {
       const client = new HttpClient(server.baseUrl);
       await expect(
         client.requestStream("POST", "/sandboxes/abc/executions"),
-      ).rejects.toBeInstanceOf(SandboxRestartedError);
+      ).rejects.toBeInstanceOf(SandboxCrashedError);
     } finally {
       await server.close();
     }
@@ -52,7 +52,7 @@ describe("sandbox restarted after a guest crash", () => {
     try {
       const client = new HttpClient(server.baseUrl);
       await expect(client.requestJson("GET", "/sandboxes/abc/files")).rejects.toBeInstanceOf(
-        SandboxRestartedError,
+        SandboxCrashedError,
       );
     } finally {
       await server.close();
@@ -71,7 +71,7 @@ describe("sandbox restarted after a guest crash", () => {
         .requestJson("GET", "/sandboxes/abc/files")
         .catch((caught: unknown) => caught);
       expect(error).toBeInstanceOf(SandboxServiceError);
-      expect(error).not.toBeInstanceOf(SandboxRestartedError);
+      expect(error).not.toBeInstanceOf(SandboxCrashedError);
     } finally {
       await server.close();
     }
@@ -90,7 +90,7 @@ describe("sandbox restarted after a guest crash", () => {
     try {
       const client = new HttpClient(server.baseUrl, undefined, { baseDelayMs: 0 });
       await expect(client.requestJson("GET", "/sandboxes/abc/files")).rejects.toBeInstanceOf(
-        SandboxRestartedError,
+        SandboxCrashedError,
       );
       expect(hits).toBe(1);
     } finally {

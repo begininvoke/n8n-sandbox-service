@@ -306,11 +306,17 @@ func (r *Runtime) activateSandboxVM(ctx context.Context, state *sandboxState, t 
 // restorable.
 func (r *Runtime) startGuest(ctx context.Context, state *sandboxState, t *stepTimer) error {
 	r.mu.Lock()
-	coldBoot, params := state.mustColdBoot, state.bootParams
+	coldBoot, params, kernel := state.mustColdBoot, state.bootParams, state.kernel
 	state.mustColdBoot = true
 	r.mu.Unlock()
 
 	if coldBoot {
+		// Checked on this branch alone: a restore boots the kernel out of its memory
+		// image and never opens the file, so a wake that has a snapshot to return to
+		// has no reason to care what the template holds now.
+		if err := r.verifyKernelPin(kernel); err != nil {
+			return err
+		}
 		if err := t.step(stepColdBoot, func() error {
 			return r.deps.coldBoot(ctx, state.socketPath, params)
 		}); err != nil {
