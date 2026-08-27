@@ -462,6 +462,56 @@ func TestConcurrentRequestsAfterACrashShareOneRecoveryAndAllLearnOfIt(t *testing
 	}
 }
 
+// What makes that burst a burst rather than a mix of 409s and quiet successes: a
+// recovering sandbox stays marked not-running for the whole cold boot, and
+// DaemonURL refuses one. So a request arriving while the recovery runs is routed
+// into the same wake and learns what happened, instead of being handed a URL and
+// proxied into a guest whose memory had just been lost, told nothing. The transition
+// claim covers the rest, from the moment it is marked running to the wake returning.
+func TestDaemonURLRefusesWhileARecoveryIsInFlight(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	exits := &guestExitStub{}
+	exits.install(rt, &fakeProcess{})
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	exits.fire(t, 0)
+
+	var coldBoots atomic.Int32
+	release := make(chan struct{})
+	rt.deps.coldBoot = func(context.Context, string, *bootParams) error {
+		coldBoots.Add(1)
+		<-release
+		return nil
+	}
+
+	wakeDone := make(chan runnerruntime.WakeResult, 1)
+	go func() {
+		wake, err := rt.EnsureSandboxRunning(context.Background(), sandboxID)
+		if err != nil {
+			t.Errorf("EnsureSandboxRunning() failed: %v", err)
+		}
+		wakeDone <- wake
+	}()
+	waitForColdBoot(t, &coldBoots)
+
+	// Parked in the cold boot: the guest is coming up and every step that could fail
+	// is behind it, which is the latest a request could plausibly be let through.
+	if _, err := rt.DaemonURL(context.Background(), sandboxID); !errors.Is(err, runnerruntime.ErrSandboxNotRunning) {
+		t.Fatalf("DaemonURL() error = %v, want %v so a request arriving mid-recovery joins it instead of being proxied into it",
+			err, runnerruntime.ErrSandboxNotRunning)
+	}
+
+	close(release)
+	if wake := <-wakeDone; !wake.Recovered {
+		t.Error("the recovery did not report itself")
+	}
+}
+
 // A sandbox recovered once is still pinned: a cold boot leaves it with no snapshot
 // describing its rootfs, no more than the crash did. So a second crash recovers the
 // same way, and each recovery is reported to the request that drove it.
