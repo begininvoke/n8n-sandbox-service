@@ -26,7 +26,7 @@ export class SandboxServiceError extends Error {
  * - processes started by earlier executions are gone, and nothing restarts them;
  * - completed executions are no longer readable, so `getExecution` returns a
  *   not-found error even for a command that succeeded before the restart;
- * - files writes that were not persisted to disk are lost;
+ * - file writes that were not persisted to disk are lost;
  * - a client-supplied `execId` is no longer idempotent — re-posting one that ran
  *   before the restart runs the command again rather than replaying its result.
  *
