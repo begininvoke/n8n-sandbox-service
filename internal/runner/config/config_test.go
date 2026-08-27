@@ -3,6 +3,7 @@ package config
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -11,7 +12,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("SANDBOX_RUNNER_API_KEYS", "test-key")
 	t.Setenv("SANDBOX_RUNNER_API_GRPC_ADDR", "api:9090")
 	t.Setenv("SANDBOX_RUNNER_REGISTRATION_TOKEN", "reg-token")
-	t.Setenv("SANDBOX_RUNNER_HTTP_BASE_URL", "http://runner:8080")
+	t.Setenv("SANDBOX_RUNNER_HTTP_BASE_URL", "https://runner:8080")
 	t.Setenv("SANDBOX_RUNNER_REGISTRATION_GRPC_CA_FILE", "/tmp/reg-ca.crt")
 	t.Setenv("SANDBOX_RUNNER_REGISTRATION_GRPC_CERT_FILE", "/tmp/reg.crt")
 	t.Setenv("SANDBOX_RUNNER_REGISTRATION_GRPC_KEY_FILE", "/tmp/reg.key")
@@ -83,6 +84,50 @@ func TestLoadRejectsPartialControlGRPCTLS(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected Load to reject partial SANDBOX_RUNNER_CONTROL_GRPC_TLS_*")
+	}
+}
+
+func TestLoadRejectsPlaintextHTTPBaseURL(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SANDBOX_RUNNER_HTTP_BASE_URL", "http://runner:8080")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected Load to reject an http:// SANDBOX_RUNNER_HTTP_BASE_URL")
+	}
+}
+
+// url.Parse reports scheme https for several forms that carry no host, so a
+// scheme-only check would let the runner boot advertising a base URL nothing
+// can dial.
+//
+// Load rejects every form below at the host check itself. The advertise
+// address and the message match are here for the case where that check is
+// removed: these inputs are then still refused further down, where the control
+// gRPC address can no longer be derived from the URL, and that error names
+// SANDBOX_RUNNER_HTTP_BASE_URL as well, so a bare "did it fail" assertion would
+// not notice the loss. Setting the address removes that second net, and
+// matching the message pins which check spoke. The Helm chart and the e2e
+// scripts set the address too, so it also matches how runners really run.
+func TestLoadRejectsHTTPBaseURLWithoutHost(t *testing.T) {
+	for _, base := range []string{
+		"https:runner:8080",
+		"https://",
+		"https:",
+		"https:///files",
+	} {
+		t.Run(base, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SANDBOX_RUNNER_HTTP_BASE_URL", base)
+			t.Setenv("SANDBOX_RUNNER_CONTROL_GRPC_ADVERTISE_ADDR", "runner:9091")
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("expected Load to reject host-less SANDBOX_RUNNER_HTTP_BASE_URL %q", base)
+			}
+			if !strings.Contains(err.Error(), "must be an https:// URL with a host") {
+				t.Fatalf("expected the host check to reject %q, got: %v", base, err)
+			}
+		})
 	}
 }
 

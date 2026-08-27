@@ -338,16 +338,20 @@ monitoring:
 
 This renders one `ServiceMonitor` for the API Service and, when the in-chart runner is enabled, one for the runner headless Service. It also enables the matching `/metrics` handlers in the API and runner containers. Use `monitoring.serviceMonitor.api.enabled` or `monitoring.serviceMonitor.runner.enabled` to disable either scrape target.
 
+The runner's HTTP listener serves TLS, so its scrape overrides the shared `scheme` with `monitoring.serviceMonitor.runner.scheme` (`https`). The scrape verifies that TLS by default: with `monitoring.serviceMonitor.runner.tlsConfig` left empty, the chart points `ca` at `tls.certificates.runnerControlServer.secretName` and pins `serverName` to the runner Service DNS name. Targets are scraped by pod IP, which is not a SAN, so that pin is what makes verification succeed; every runner pod presents the same certificate, so one name covers the StatefulSet.
+
+Under `tls.mode=certManager` this works as rendered, because the chart issues that certificate itself. Under `tls.mode=existingSecret` the certificate is yours, so it must carry `<runner-service>.<namespace>.svc.cluster.local` as a SAN or the scrape fails to verify. Setting `monitoring.serviceMonitor.runner.tlsConfig` replaces the default outright, so if you cannot reissue, `insecureSkipVerify: true` is the escape hatch — acceptable in that `/metrics` is unauthenticated and carries no tenant or sandbox identifiers, at the cost of letting an on-path peer forge the metrics your alerts read.
+
 ## Runner Identity
 
 The in-cluster runner is deployed as a StatefulSet with a headless Service so each runner pod has direct, DNS-based addressability from the API:
 
 ```text
-http://<pod>.<runner-service>.<namespace>.svc.cluster.local:8080
+https://<pod>.<runner-service>.<namespace>.svc.cluster.local:8080
 <pod>.<runner-service>.<namespace>.svc.cluster.local:9091
 ```
 
-The API must call the specific runner that owns a sandbox; a load-balanced Service is not enough for exec/files/control operations. Stable pod DNS also makes the runner control gRPC certificate SANs practical.
+The API must call the specific runner that owns a sandbox; a load-balanced Service is not enough for exec/files/control operations. Stable pod DNS also makes the runner certificate SANs practical: both the HTTP listener and the control gRPC listener serve TLS with the same certificate, so those names must appear in its SANs.
 
 If a runner dies, sandboxes on that runner should be treated as lost.
 
