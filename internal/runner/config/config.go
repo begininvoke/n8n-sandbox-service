@@ -261,6 +261,16 @@ func Load() (*Config, error) {
 	if cfg.RunnerHTTPBaseURL == "" {
 		return nil, fmt.Errorf("SANDBOX_RUNNER_HTTP_BASE_URL must be set")
 	}
+	// The HTTP listener serves TLS, and this URL is what the runner advertises
+	// to the API in heartbeats, so an http:// value would send every request to
+	// the wrong scheme. The host has to be checked separately: url.Parse reads
+	// "https:runner:8080" as an opaque path and "https://" as empty, both with
+	// scheme https and no host, and either would leave the runner advertising
+	// an address nothing can dial and no host to derive the control gRPC
+	// advertise address from.
+	if u, err := url.Parse(cfg.RunnerHTTPBaseURL); err != nil || !strings.EqualFold(u.Scheme, "https") || u.Host == "" {
+		return nil, fmt.Errorf("SANDBOX_RUNNER_HTTP_BASE_URL must be an https:// URL with a host, got %q", cfg.RunnerHTTPBaseURL)
+	}
 
 	if v := strings.TrimSpace(os.Getenv("SANDBOX_RUNNER_CONTROL_GRPC_LISTEN_ADDR")); v != "" {
 		cfg.ControlGRPCListenAddr = v
