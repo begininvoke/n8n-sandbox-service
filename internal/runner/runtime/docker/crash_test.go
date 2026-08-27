@@ -337,10 +337,10 @@ func TestAStopThatFailedDoesNotExcuseALaterCrash(t *testing.T) {
 
 // Stopping a container Docker is between restarts of is the one stop that gets no
 // death of its own: the crash already emitted it, and the stop only cancels the
-// restart. Docker reports such a container as running, so the stop records a mark
-// like any other and nothing ever claims it. Left in place it is spent on the next
-// death of the same container, which is the crash after the wake below — served with
-// no 409, and with network rules still naming the address the container had.
+// restart. Docker reports such a container as running, so the stop is not a no-op —
+// but it must record no expected death, or the mark nothing ever claims is spent on
+// the next death of the same container, which is the crash after the wake below —
+// served with no 409, and with network rules still naming the address it had.
 func TestAStopDuringDockersRestartDoesNotExcuseALaterCrash(t *testing.T) {
 	backend := &crashBackend{
 		states: []containerState{
@@ -426,6 +426,44 @@ func TestAFailedStopDoesNotTakeBackAConcurrentStopsMark(t *testing.T) {
 
 	if m.wasRestarted(crashSandboxID) {
 		t.Error("a death the runner asked for was recorded as a crash, so the next request is served a 409 for a restart that never happened")
+	}
+	if got := rec.GuestDeathCount(); got != 0 {
+		t.Errorf("guest death metric = %v, want 0: a stop the runner asked for is not a crash", got)
+	}
+}
+
+// A stop's die event reaches the runner through a `docker events` subprocess, so it
+// can still be in that pipe when the next request wakes the sandbox and starts the
+// container again — an idle stop followed by a client coming back is exactly that
+// sequence. The mark has to survive the start: dropping it there left the stop's own
+// death to be read as a crash, and the request after it paying a 409 for a restart
+// that never happened.
+func TestAStopsDeathIsStillExcusedWhenAWakeBeatsTheEvent(t *testing.T) {
+	backend := &crashBackend{
+		states: []containerState{
+			// The stop inspects a healthy container; the wake that follows finds it
+			// exited, because the stop it is racing has already landed.
+			runningState(),
+			{Status: containerStatusExited},
+		},
+		ip: "172.18.0.2",
+	}
+	m, _ := newCrashRuntime(t, backend)
+	rec := metrics.NewRunnerRecorder(true)
+	m.SetMetricsRecorder(rec)
+
+	if err := m.StopSandboxContainer(context.Background(), crashSandboxID); err != nil {
+		t.Fatalf("StopSandboxContainer() failed: %v", err)
+	}
+	if _, err := m.EnsureSandboxRunning(context.Background(), crashSandboxID); err != nil {
+		t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+	}
+
+	// Only now does the stop's death come out of the pipe.
+	m.handleContainerDeath(crashContainerID, crashSandboxID)
+
+	if m.wasRestarted(crashSandboxID) {
+		t.Error("an idle stop's own death was read as a crash, so the next request is refused with a 409 for a restart that never happened")
 	}
 	if got := rec.GuestDeathCount(); got != 0 {
 		t.Errorf("guest death metric = %v, want 0: a stop the runner asked for is not a crash", got)

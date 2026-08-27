@@ -386,15 +386,10 @@ func (m *Runtime) ensureSandboxRunningOnce(ctx context.Context, sandboxID string
 		if !canStartContainer(inspect.State) {
 			return recovering, fmt.Errorf("sandbox container is not startable from docker state %q", inspect.State.Status)
 		}
-		// A mark still recorded here belongs to a process that is already gone, so it
-		// can only ever excuse the wrong death: the stop it was recorded for either
-		// produced its event long ago or was never going to produce one. Stopping a
-		// container Docker is between restarts of is the case that reaches this — the
-		// crash already emitted the only death there was, and the stop just cancels the
-		// restart — and the container it leaves behind is the one this line is about to
-		// start. Dropped before the start, not after, because the new process can die
-		// first.
-		m.discardUnclaimedStop(containerID)
+		// A mark recorded for this container is deliberately left alone. It belongs to
+		// a stop whose die event may still be in the events pipe, and dropping it here
+		// would leave that death to be read as a crash; the stop that can never produce
+		// a death records nothing in the first place, so there is nothing to clean up.
 		if err := m.docker.startContainer(ctx, containerID); err != nil {
 			return recovering, fmt.Errorf("start container: %w", err)
 		}
@@ -484,6 +479,15 @@ func (m *Runtime) StopSandboxContainer(ctx context.Context, sandboxID string) er
 	}
 	if !inspect.State.Running {
 		return nil
+	}
+	// A container Docker is between restarts of is reported running, so this stop is
+	// not a no-op — it cancels the pending restart. What it cannot do is produce a
+	// death: the process that would have been restarted died at crash time and
+	// emitted the container's one die event already. Recording a mark for a death
+	// that never arrives is what would leave it to excuse the next real crash of this
+	// container, once a wake has started it again.
+	if inspect.State.Restarting {
+		return m.docker.stopContainer(ctx, containerID)
 	}
 	token := m.expectStop(containerID)
 	if err := m.docker.stopContainer(ctx, containerID); err != nil {

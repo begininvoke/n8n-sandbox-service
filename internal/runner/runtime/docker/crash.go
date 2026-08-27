@@ -136,15 +136,6 @@ func (m *Runtime) forgetExpectedStop(containerID string, token uint64) {
 	}
 }
 
-// discardUnclaimedStop drops a container's mark whoever recorded it. Only the wake
-// path calls it, and only where no mark can still be claimed by the stop it was
-// recorded for; see that call site for why that holds there and nowhere else.
-func (m *Runtime) discardUnclaimedStop(containerID string) {
-	m.mu.Lock()
-	delete(m.expectedStops, containerID)
-	m.mu.Unlock()
-}
-
 // takeExpectedStop consumes one expected stop for a container. Consuming rather than
 // reading is what keeps a stopped-then-restarted sandbox honest: the next death of
 // the same container is a crash again.

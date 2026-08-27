@@ -63,6 +63,13 @@ container already exited when it was removed — expires instead. Both matter: a
 outliving its reason is what would excuse a real crash of the same container, serving
 it with no `409` and with network rules still naming the address it had.
 
+The stop that cancels a pending restart records nothing at all, because the crash it
+follows already emitted the container's one death. That is decided when the stop is
+issued rather than cleaned up afterwards: a death reaches the runner through the
+`docker events` subprocess, so a mark can still be waiting on its event while the
+next request wakes the sandbox, and nothing later in the wake path can tell that mark
+apart from one whose death is never coming.
+
 `DaemonURL` then reports the sandbox as not running until the wake path has
 re-admitted it: reapplied its network policy for the address it came back on, and
 waited for its daemon. That is what forces a container which already looks healthy
